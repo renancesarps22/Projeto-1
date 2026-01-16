@@ -768,10 +768,7 @@ with tab_dash:
         # Em alguns ambientes (ex.: Cloud em reruns), variáveis podem não existir por conta de execuções parciais.
         # Garanta um nome seguro para o relatório.
         nome_report = None
-<<<<<<< HEAD
         nome_report = 'avaliacao'
-=======
->>>>>>> 1a7541f5d291f233fd3e765f3dc9fb3bdabaf0fb
         try:
             nome_report = str(nome_sel)  # sidebar
         except Exception:
@@ -779,15 +776,9 @@ with tab_dash:
         if not nome_report or nome_report == '(sem nomes)':
             if 'av' in locals() and isinstance(av, pd.DataFrame) and (not av.empty) and ('Nome' in av.columns):
                 nome_report = str(av['Nome'].astype(str).iloc[-1])
-<<<<<<< HEAD
 
         if not nome_report:
             nome_report = 'avaliacao'
-=======
-        if not nome_report:
-            nome_report = 'avaliacao'
-
->>>>>>> 1a7541f5d291f233fd3e765f3dc9fb3bdabaf0fb
         pdf_rel = _make_pdf_report(nome_report, (data_i, data_f), kpis_report, rcq_tbl)
         st.download_button('Exportar relatorio (PDF)', data=pdf_rel, file_name=f'relatorio_{nome_report}.pdf', mime='application/pdf')
 
@@ -1322,3 +1313,4 @@ with tab_reg:
             file_name="registro_treinos.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
