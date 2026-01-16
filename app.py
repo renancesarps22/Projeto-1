@@ -154,6 +154,107 @@ def _make_pdf_from_table(title: str, df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def _to_float_or_none(x, treat_zero_as_none: bool = False):
+    """Parse float; return None on blanks/invalid.
+
+    Streamlit number_input retorna 0.0 por padrão. Para medidas corporais,
+    normalmente 0 indica 'não preenchido'. Use treat_zero_as_none=True nesses casos.
+    """
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if treat_zero_as_none and abs(v) < 1e-12:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _calc_imc(peso: float | None, altura: float | None) -> float | None:
+    if peso is None or altura is None:
+        return None
+    if altura <= 0:
+        return None
+    return peso / (altura ** 2)
+
+
+def _classificacao_imc(imc: float | None) -> str | None:
+    if imc is None:
+        return None
+    # Mantém nomenclatura comum (e bate com o exemplo da planilha)
+    if imc < 18.5:
+        return "Baixo peso"
+    if imc < 25:
+        return "Peso normal"
+    if imc < 30:
+        return "Sobrepeso"
+    if imc < 35:
+        return "Obesidade Grau I"
+    if imc < 40:
+        return "Obesidade Grau II"
+    return "Obesidade Grau III"
+
+
+def _calc_dc_jp3(sexo: str | None, idade: float | None, d_pe: float | None, d_ab: float | None,
+                d_cx: float | None, d_si: float | None, d_tr: float | None) -> float | None:
+    """Densidade corporal (Jackson & Pollock 3 dobras).
+
+    Homem: Peitoral + Abdominal + Coxa
+    Mulher: Tríceps + Supra-ilíaca + Coxa
+    """
+    if sexo not in {"Homem", "Mulher"}:
+        return None
+    if idade is None:
+        return None
+
+    if sexo == "Homem":
+        vals = [d_pe, d_ab, d_cx]
+        if any(v is None for v in vals):
+            return None
+        s = sum(vals)
+        return 1.10938 - 0.0008267 * s + 0.0000016 * (s ** 2) - 0.0002574 * idade
+
+    # Mulher
+    vals = [d_tr, d_si, d_cx]
+    if any(v is None for v in vals):
+        return None
+    s = sum(vals)
+    return 1.0994921 - 0.0009929 * s + 0.0000023 * (s ** 2) - 0.0001392 * idade
+
+
+def _calc_gordura_siri(dc: float | None) -> float | None:
+    if dc is None or dc <= 0:
+        return None
+    return 495 / dc - 450
+
+
+def _calc_rcq(cc: float | None, cq: float | None) -> float | None:
+    if cc is None or cq is None:
+        return None
+    if cq <= 0:
+        return None
+    return cc / cq
+
+
+def _classificacao_rcq(sexo: str | None, rcq: float | None) -> str | None:
+    """Classificação de risco (padrão OMS, simplificado em 3 níveis)."""
+    if rcq is None or sexo not in {"Homem", "Mulher"}:
+        return None
+    if sexo == "Homem":
+        if rcq < 0.90:
+            return "Baixo Risco"
+        if rcq < 1.00:
+            return "Risco Moderado"
+        return "Alto Risco"
+    # Mulher
+    if rcq < 0.80:
+        return "Baixo Risco"
+    if rcq < 0.85:
+        return "Risco Moderado"
+    return "Alto Risco"
+
+
 # ---------------------------
 # Sidebar: Load file + filters
 # ---------------------------
@@ -416,29 +517,79 @@ with tab_av:
                     sexo_col = "Sexo" if "Sexo" in avaliacao.columns else None
                     sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0) if sexo_col else None
 
-                # Campos principais (se existirem na planilha)
-                campos = []
-                for c in ["Peso", "G", "MM", "IMC", "CC", "CQ", "CA", "RCQ", "RISCO"]:
-                    if c in avaliacao.columns:
-                        campos.append(c)
+                # --- Entradas completas, seguindo a planilha ---
+                # Dados pessoais / antropometria
+                p1, p2, p3, p4 = st.columns(4)
+                with p1:
+                    idade = st.number_input("Idade", value=0, step=1) if "Idade" in avaliacao.columns else None
+                with p2:
+                    peso = st.number_input("Peso (kg)", value=0.0, step=0.1) if "Peso" in avaliacao.columns else None
+                with p3:
+                    altura = st.number_input("Altura (m)", value=0.0, step=0.01) if "Altura" in avaliacao.columns else None
+                with p4:
+                    cc = st.number_input("CC (cintura)", value=0.0, step=0.1) if "CC" in avaliacao.columns else None
 
-                # Inputs numéricos / texto
-                vals: dict[str, object] = {}
-                cols_ui = st.columns(4)
-                idx = 0
-                for c in campos:
-                    with cols_ui[idx % 4]:
-                        if c in ["RISCO"]:
-                            vals[c] = st.text_input("RISCO", value="")
-                        else:
-                            vals[c] = st.number_input(c, value=0.0, step=0.1)
-                    idx += 1
+                p5, p6, p7, p8 = st.columns(4)
+                with p5:
+                    cq = st.number_input("CQ (quadril)", value=0.0, step=0.1) if "CQ" in avaliacao.columns else None
+                with p6:
+                    ca = st.number_input("CA (abdômen)", value=0.0, step=0.1) if "CA" in avaliacao.columns else None
+                with p7:
+                    pass
+                with p8:
+                    pass
+
+                st.markdown("**Dobras cutâneas (mm)**")
+                d1, d2, d3, d4, d5 = st.columns(5)
+                with d1:
+                    d_pe = st.number_input("D PE (peitoral)", value=0.0, step=0.1) if "D PE" in avaliacao.columns else None
+                with d2:
+                    d_ab = st.number_input("D AB (abdominal)", value=0.0, step=0.1) if "D AB" in avaliacao.columns else None
+                with d3:
+                    d_cx = st.number_input("D CX (coxa)", value=0.0, step=0.1) if "D CX" in avaliacao.columns else None
+                with d4:
+                    d_si = st.number_input("D SI (supra-ilíaca)", value=0.0, step=0.1) if "D SI" in avaliacao.columns else None
+                with d5:
+                    d_tr = st.number_input("D TR (tríceps)", value=0.0, step=0.1) if "D TR" in avaliacao.columns else None
+
+                # Prévia dos cálculos (opcional)
+                sexo_calc = sexo_val if sexo_col else None
+                idade_f = _to_float_or_none(idade, treat_zero_as_none=True)
+                peso_f = _to_float_or_none(peso, treat_zero_as_none=True)
+                altura_f = _to_float_or_none(altura, treat_zero_as_none=True)
+                cc_f = _to_float_or_none(cc, treat_zero_as_none=True)
+                cq_f = _to_float_or_none(cq, treat_zero_as_none=True)
+
+                d_pe_f = _to_float_or_none(d_pe, treat_zero_as_none=True)
+                d_ab_f = _to_float_or_none(d_ab, treat_zero_as_none=True)
+                d_cx_f = _to_float_or_none(d_cx, treat_zero_as_none=True)
+                d_si_f = _to_float_or_none(d_si, treat_zero_as_none=True)
+                d_tr_f = _to_float_or_none(d_tr, treat_zero_as_none=True)
+
+                imc_calc = _calc_imc(peso_f, altura_f)
+                cls_imc = _classificacao_imc(imc_calc)
+                dc_calc = _calc_dc_jp3(sexo_calc, idade_f, d_pe_f, d_ab_f, d_cx_f, d_si_f, d_tr_f)
+                g_calc = _calc_gordura_siri(dc_calc)
+                mm_calc = (100 - g_calc) if g_calc is not None else None
+                rcq_calc = _calc_rcq(cc_f, cq_f)
+                risco_calc = _classificacao_rcq(sexo_calc, rcq_calc)
+
+                prev1, prev2, prev3, prev4, prev5 = st.columns(5)
+                prev1.metric("IMC", f"{imc_calc:.2f}" if imc_calc is not None else "-")
+                prev2.metric("Classificação", cls_imc or "-")
+                prev3.metric("DC", f"{dc_calc:.6f}" if dc_calc is not None else "-")
+                prev4.metric("% Gordura", f"{g_calc:.2f} %" if g_calc is not None else "-")
+                prev5.metric("% Massa magra", f"{mm_calc:.2f} %" if mm_calc is not None else "-")
+
+                st.caption("Obs.: DC e %G são calculados pelo protocolo Jackson & Pollock (3 dobras) + Siri, igual ao padrão usado na sua planilha.")
 
                 submitted = st.form_submit_button("Salvar avaliação")
 
             if submitted:
                 if not str(nome_novo).strip():
                     st.error("Informe o Nome.")
+                elif sexo_col and not (sexo_val or "") .strip():
+                    st.error("Selecione o Sexo para calcular DC, % gordura, % massa magra e risco do RCQ.")
                 else:
                     # Monta linha com as mesmas colunas da planilha
                     row = {c: None for c in avaliacao.columns}
@@ -447,22 +598,38 @@ with tab_av:
                     if sexo_col:
                         row[sexo_col] = sexo_val if sexo_val else None
 
-                    for k, v in vals.items():
-                        # deixa vazio como None
-                        if k == "RISCO" and isinstance(v, str) and not v.strip():
-                            row[k] = None
-                        else:
-                            row[k] = v
+                    # salva entradas brutas (seguindo as colunas existentes)
+                    if "Idade" in avaliacao.columns:
+                        row["Idade"] = idade_f
+                    if "Peso" in avaliacao.columns:
+                        row["Peso"] = peso_f
+                    if "Altura" in avaliacao.columns:
+                        row["Altura"] = altura_f
+                    for c, v in [("CC", cc_f), ("CQ", cq_f), ("CA", _to_float_or_none(ca, treat_zero_as_none=True))]:
+                        if c in avaliacao.columns:
+                            row[c] = v
 
-                    # Calcula RCQ se possível (CC/CQ)
+                    # Dobras
+                    for c, v in [("D PE", d_pe_f), ("D AB", d_ab_f), ("D CX", d_cx_f), ("D SI", d_si_f), ("D TR", d_tr_f)]:
+                        if c in avaliacao.columns:
+                            row[c] = v
+
+                    # Cálculos (igual planilha)
+                    if "IMC" in avaliacao.columns:
+                        row["IMC"] = imc_calc
+                    if "Classificação" in avaliacao.columns:
+                        row["Classificação"] = cls_imc
+                    if "DC" in avaliacao.columns:
+                        row["DC"] = dc_calc
+                    if "G" in avaliacao.columns:
+                        row["G"] = g_calc
+                    if "MM" in avaliacao.columns:
+                        row["MM"] = mm_calc
+
                     if "RCQ" in avaliacao.columns:
-                        try:
-                            cc = float(vals.get("CC", 0.0)) if "CC" in vals else float(row.get("CC") or 0.0)
-                            cq = float(vals.get("CQ", 0.0)) if "CQ" in vals else float(row.get("CQ") or 0.0)
-                            if cq and cc:
-                                row["RCQ"] = cc / cq
-                        except Exception:
-                            pass
+                        row["RCQ"] = rcq_calc
+                    if "RISCO" in avaliacao.columns:
+                        row["RISCO"] = risco_calc
 
                     _append_avaliacao(row)
                     st.success("Avaliação salva! Ela será combinada com sua planilha durante o uso do app.")
