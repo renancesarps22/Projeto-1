@@ -14,6 +14,7 @@ st.set_page_config(page_title="App Personal", layout="wide")
 
 DEFAULT_XLSX_PATH = "APP PERSONAL.xlsx"  # keep in same folder on deploy
 REGISTRO_PATH = "registro_treinos.csv"   # local persistence (works on Streamlit Cloud)
+AVALIACOES_PATH = "avaliacoes_usuario.csv"  # avaliações adicionadas via app
 
 # ---------------------------
 # Helpers
@@ -63,6 +64,33 @@ def _append_registro(rows: list[dict]):
             df_new[col] = None
     df_all = pd.concat([df_old, df_new[df_old.columns]], ignore_index=True)
     df_all.to_csv(REGISTRO_PATH, index=False)
+
+
+def _read_avaliacoes_extra() -> pd.DataFrame:
+    """Avaliações criadas pelo usuário via app (persistência local)."""
+    if os.path.exists(AVALIACOES_PATH):
+        df = pd.read_csv(AVALIACOES_PATH)
+        if "Data" in df.columns:
+            df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+        return df
+    return pd.DataFrame()
+
+
+def _append_avaliacao(row: dict):
+    df_old = _read_avaliacoes_extra()
+    df_new = pd.DataFrame([row])
+    # alinhar colunas
+    if not df_old.empty:
+        for col in df_old.columns:
+            if col not in df_new.columns:
+                df_new[col] = None
+        for col in df_new.columns:
+            if col not in df_old.columns:
+                df_old[col] = None
+        df_all = pd.concat([df_old[df_new.columns], df_new[df_new.columns]], ignore_index=True)
+    else:
+        df_all = df_new
+    df_all.to_csv(AVALIACOES_PATH, index=False)
 
 
 def _kpi_delta(series: pd.Series):
@@ -143,8 +171,17 @@ THEMES_CSS = {
     "Escuro (padrão)": "",
     "Claro": """
         <style>
-        .stApp { background: #ffffff; }
-        [data-testid="stHeader"] { background: rgba(255,255,255,0.7); }
+        /* Tema claro com contraste alto */
+        .stApp { background: #ffffff; color: #111111; }
+        [data-testid="stHeader"] { background: rgba(255,255,255,0.85); }
+        /* Textos e labels (evita sobrescrever cores de delta) */
+        body, p, span, div, label, h1, h2, h3, h4, h5, h6 { color: #111111; }
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricValue"] { color: #111111 !important; }
+        /* Mantém cor do delta (verde/vermelho) */
+        [data-testid="stMetricDelta"] { filter: none; }
+        /* Tabelas/DF */
+        [data-testid="stDataFrame"] * { color: #111111 !important; }
         </style>
     """,
     "Azul": """
@@ -160,6 +197,9 @@ THEMES_CSS = {
         </style>
     """,
 }
+
+# Plotly template por tema
+PLOTLY_TEMPLATE = "plotly_white" if tema == "Claro" else "plotly_dark"
 
 st.markdown(THEMES_CSS.get(tema, ""), unsafe_allow_html=True)
 
@@ -182,6 +222,20 @@ dados_treinos = sheets.get("DADOS_TREINOS", pd.DataFrame()).copy()
 # Normalize avaliacao
 if not avaliacao.empty and "Data" in avaliacao.columns:
     avaliacao["Data"] = _safe_to_datetime(avaliacao["Data"]).dt.date
+
+# Mescla avaliações extras criadas via app
+av_extra = _read_avaliacoes_extra()
+if not av_extra.empty:
+    # alinhar colunas entre base e extra
+    for col in avaliacao.columns:
+        if col not in av_extra.columns:
+            av_extra[col] = None
+    for col in av_extra.columns:
+        if col not in avaliacao.columns:
+            avaliacao[col] = None
+    avaliacao = pd.concat([avaliacao[av_extra.columns], av_extra[av_extra.columns]], ignore_index=True)
+    if "Data" in avaliacao.columns:
+        avaliacao["Data"] = pd.to_datetime(avaliacao["Data"], errors="coerce").dt.date
 
 # Name filter
 nomes = []
@@ -282,14 +336,14 @@ with tab1:
         with g1:
             with st.container(border=True):
                 if col_peso:
-                    fig = px.line(av, x="Data", y=col_peso, markers=True, title="Peso ao longo do tempo")
+                    fig = px.line(av, x="Data", y=col_peso, markers=True, title="Peso ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Coluna de peso não encontrada.")
 
             with st.container(border=True):
                 if col_gord:
-                    fig = px.line(av, x="Data", y=col_gord, markers=True, title="% Gordura ao longo do tempo")
+                    fig = px.line(av, x="Data", y=col_gord, markers=True, title="% Gordura ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Coluna de % gordura não encontrada.")
@@ -297,7 +351,7 @@ with tab1:
         with g2:
             with st.container(border=True):
                 if col_mm:
-                    fig = px.line(av, x="Data", y=col_mm, markers=True, title="% Massa magra ao longo do tempo")
+                    fig = px.line(av, x="Data", y=col_mm, markers=True, title="% Massa magra ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Coluna de % massa magra não encontrada.")
@@ -317,6 +371,7 @@ with tab1:
                         color="Circunferência",
                         markers=True,
                         title="Circunferências ao longo do tempo",
+                        template=PLOTLY_TEMPLATE,
                     )
                     st.plotly_chart(fig, use_container_width=True)
                 else:
@@ -326,7 +381,7 @@ with tab1:
         with g3:
             with st.container(border=True):
                 if "RCQ" in av.columns:
-                    fig = px.line(av, x="Data", y="RCQ", markers=True, title="RCQ ao longo do tempo")
+                    fig = px.line(av, x="Data", y="RCQ", markers=True, title="RCQ ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Coluna RCQ não encontrada.")
@@ -347,6 +402,71 @@ with tab1:
 # =======================
 with tab_av:
     st.subheader("Avaliação Física")
+
+    # ----- Criar nova avaliação -----
+    if not avaliacao.empty and "Data" in avaliacao.columns and "Nome" in avaliacao.columns:
+        with st.expander("Adicionar nova avaliação"):
+            with st.form("form_nova_avaliacao", border=True):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    nome_novo = st.text_input("Nome", value=nome_sel if nome_sel and nome_sel != "(sem nomes)" else "")
+                with c2:
+                    data_nova = st.date_input("Data", value=date.today())
+                with c3:
+                    sexo_col = "Sexo" if "Sexo" in avaliacao.columns else None
+                    sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0) if sexo_col else None
+
+                # Campos principais (se existirem na planilha)
+                campos = []
+                for c in ["Peso", "G", "MM", "IMC", "CC", "CQ", "CA", "RCQ", "RISCO"]:
+                    if c in avaliacao.columns:
+                        campos.append(c)
+
+                # Inputs numéricos / texto
+                vals: dict[str, object] = {}
+                cols_ui = st.columns(4)
+                idx = 0
+                for c in campos:
+                    with cols_ui[idx % 4]:
+                        if c in ["RISCO"]:
+                            vals[c] = st.text_input("RISCO", value="")
+                        else:
+                            vals[c] = st.number_input(c, value=0.0, step=0.1)
+                    idx += 1
+
+                submitted = st.form_submit_button("Salvar avaliação")
+
+            if submitted:
+                if not str(nome_novo).strip():
+                    st.error("Informe o Nome.")
+                else:
+                    # Monta linha com as mesmas colunas da planilha
+                    row = {c: None for c in avaliacao.columns}
+                    row["Nome"] = str(nome_novo).strip()
+                    row["Data"] = data_nova
+                    if sexo_col:
+                        row[sexo_col] = sexo_val if sexo_val else None
+
+                    for k, v in vals.items():
+                        # deixa vazio como None
+                        if k == "RISCO" and isinstance(v, str) and not v.strip():
+                            row[k] = None
+                        else:
+                            row[k] = v
+
+                    # Calcula RCQ se possível (CC/CQ)
+                    if "RCQ" in avaliacao.columns:
+                        try:
+                            cc = float(vals.get("CC", 0.0)) if "CC" in vals else float(row.get("CC") or 0.0)
+                            cq = float(vals.get("CQ", 0.0)) if "CQ" in vals else float(row.get("CQ") or 0.0)
+                            if cq and cc:
+                                row["RCQ"] = cc / cq
+                        except Exception:
+                            pass
+
+                    _append_avaliacao(row)
+                    st.success("Avaliação salva! Ela será combinada com sua planilha durante o uso do app.")
+                    st.rerun()
 
     if av.empty:
         st.info("Nenhum dado encontrado em AVALIACAO_FISICA para os filtros atuais.")
