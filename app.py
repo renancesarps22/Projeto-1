@@ -764,8 +764,22 @@ with tab_dash:
             'RCQ': (f'{rcq_atual:.2f}' if 'rcq_atual' in locals() and rcq_atual is not None else '-', '-', ''),
         }
         rcq_tbl = av[[c for c in ['Data','RCQ','RISCO'] if c in av.columns]].copy() if 'av' in locals() else pd.DataFrame()
-        pdf_rel = _make_pdf_report(str(nome_sel), (data_i, data_f), kpis_report, rcq_tbl)
-        st.download_button('Exportar relatorio (PDF)', data=pdf_rel, file_name=f'relatorio_{nome_sel}.pdf', mime='application/pdf')
+
+        # Em alguns ambientes (ex.: Cloud em reruns), variáveis podem não existir por conta de execuções parciais.
+        # Garanta um nome seguro para o relatório.
+        nome_report = None
+        try:
+            nome_report = str(nome_sel)  # sidebar
+        except Exception:
+            nome_report = None
+        if not nome_report or nome_report == '(sem nomes)':
+            if 'av' in locals() and isinstance(av, pd.DataFrame) and (not av.empty) and ('Nome' in av.columns):
+                nome_report = str(av['Nome'].astype(str).iloc[-1])
+        if not nome_report:
+            nome_report = 'avaliacao'
+
+        pdf_rel = _make_pdf_report(nome_report, (data_i, data_f), kpis_report, rcq_tbl)
+        st.download_button('Exportar relatorio (PDF)', data=pdf_rel, file_name=f'relatorio_{nome_report}.pdf', mime='application/pdf')
 
         st.divider()
 
