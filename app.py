@@ -1,96 +1,202 @@
 import io
 import os
-from datetime import date
+import zipfile
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-# Export PDF
+# Optional DB (Supabase/Neon/Postgres)
+try:
+    from sqlalchemy import create_engine, text as sql_text
+except Exception:  # pragma: no cover
+    create_engine = None
+    sql_text = None
+
+# PDF export
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 st.set_page_config(page_title="App Personal", layout="wide")
 
 DEFAULT_XLSX_PATH = "APP PERSONAL.xlsx"  # keep in same folder on deploy
-REGISTRO_PATH = "registro_treinos.csv"   # local persistence (works on Streamlit Cloud)
-AVALIACOES_PATH = "avaliacoes_usuario.csv"  # avaliações adicionadas via app
+REGISTRO_PATH = "registro_treinos.csv"   # local persistence
+AVALIACOES_DB_PATH = "avaliacoes_db.csv" # base editável (inicializa a partir do Excel)
 
-# ---------------------------
+# Optional DB URL (set in Streamlit secrets as DATABASE_URL)
+DATABASE_URL = (os.getenv("DATABASE_URL") or (st.secrets.get("DATABASE_URL", None) if hasattr(st, "secrets") else None))
+
+BACKUP_ZIP_NAME = "backup_app_personal.zip"
+
+# -------------------------------------------------
 # Helpers
-# ---------------------------
-
-def _load_workbook(uploaded_file: bytes | None):
-    """Return dict of DataFrames for expected sheets."""
-    if uploaded_file is not None:
-        data = uploaded_file
-        xls = pd.ExcelFile(io.BytesIO(data))
-    else:
-        if not os.path.exists(DEFAULT_XLSX_PATH):
-            raise FileNotFoundError(
-                f"Arquivo '{DEFAULT_XLSX_PATH}' nao encontrado. "
-                "Envie o Excel pelo seletor acima ou coloque o arquivo junto do app."
-            )
-        xls = pd.ExcelFile(DEFAULT_XLSX_PATH)
-
-    sheets = {name: xls.parse(name) for name in xls.sheet_names}
-    return sheets
-
+# -------------------------------------------------
 
 def _safe_to_datetime(s):
     return pd.to_datetime(s, errors="coerce")
 
 
-def _read_registro() -> pd.DataFrame:
-    if os.path.exists(REGISTRO_PATH):
-        df = pd.read_csv(REGISTRO_PATH)
-        # normalize types
-        if "Data" in df.columns:
-            df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
-        return df
-    return pd.DataFrame(
-        columns=[
-            "Data", "Nome", "Grupo muscular", "Exercicio", "Series", "Repeticoes", "Carga (kg)", "Observacoes"
-        ]
-    )
+def _load_workbook(uploaded_file: bytes | None):
+    """Return dict of DataFrames for all sheets."""
+    if uploaded_file is not None:
+        xls = pd.ExcelFile(io.BytesIO(uploaded_file))
+    else:
+        if not os.path.exists(DEFAULT_XLSX_PATH):
+            raise FileNotFoundError(
+                f"Arquivo '{DEFAULT_XLSX_PATH}' nao encontrado. "
+                "Envie o Excel pelo seletor da barra lateral ou coloque o arquivo junto do app."
+            )
+        xls = pd.ExcelFile(DEFAULT_XLSX_PATH)
+
+    return {name: xls.parse(name) for name in xls.sheet_names}
 
 
-def _append_registro(rows: list[dict]):
-    df_old = _read_registro()
-    df_new = pd.DataFrame(rows)
-    # keep consistent column order
-    for col in df_old.columns:
-        if col not in df_new.columns:
-            df_new[col] = None
-    df_all = pd.concat([df_old, df_new[df_old.columns]], ignore_index=True)
-    df_all.to_csv(REGISTRO_PATH, index=False)
+def _to_date_col(df: pd.DataFrame, col: str = "Data") -> pd.DataFrame:
+    if col in df.columns:
+        df[col] = _safe_to_datetime(df[col]).dt.date
+    return df
 
 
-def _read_avaliacoes_extra() -> pd.DataFrame:
-    """Avaliações criadas pelo usuário via app (persistência local)."""
-    if os.path.exists(AVALIACOES_PATH):
-        df = pd.read_csv(AVALIACOES_PATH)
-        if "Data" in df.columns:
-            df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
-        return df
+def _read_csv(path: str) -> pd.DataFrame:
+    if os.path.exists(path):
+        return pd.read_csv(path)
     return pd.DataFrame()
 
 
-def _append_avaliacao(row: dict):
-    df_old = _read_avaliacoes_extra()
-    df_new = pd.DataFrame([row])
-    # alinhar colunas
-    if not df_old.empty:
-        for col in df_old.columns:
-            if col not in df_new.columns:
-                df_new[col] = None
-        for col in df_new.columns:
-            if col not in df_old.columns:
-                df_old[col] = None
-        df_all = pd.concat([df_old[df_new.columns], df_new[df_new.columns]], ignore_index=True)
-    else:
-        df_all = df_new
-    df_all.to_csv(AVALIACOES_PATH, index=False)
+def _write_csv(df: pd.DataFrame, path: str):
+    df.to_csv(path, index=False)
+
+
+
+def _ensure_id(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee an ID column (string)."""
+    if "ID" not in df.columns:
+        df["ID"] = None
+    if "Nome" in df.columns and "Data" in df.columns:
+        missing = df["ID"].isna() | (df["ID"].astype(str).str.strip() == "")
+        if missing.any():
+            # stable id by Nome+Data+index
+            base = (
+                df.loc[missing, "Nome"].astype(str).str.strip().fillna("")
+                + "|"
+                + pd.to_datetime(df.loc[missing, "Data"], errors="coerce").astype(str)
+                + "|"
+                + df.loc[missing].index.astype(str)
+            )
+            df.loc[missing, "ID"] = base.apply(lambda x: str(abs(hash(x))))
+    df["ID"] = df["ID"].astype(str)
+    return df
+
+
+def _db_url():
+    """Return DATABASE_URL if configured (Streamlit secrets or env)."""
+    try:
+        if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+            return str(st.secrets["DATABASE_URL"]).strip()
+    except Exception:
+        pass
+    return (os.getenv("DATABASE_URL") or "").strip()
+
+def _db_enabled() -> bool:
+    return bool(_db_url()) and create_engine is not None
+
+@st.cache_resource
+def _get_engine():
+    return create_engine(_db_url(), pool_pre_ping=True)
+
+def _db_init_tables():
+    if not _db_enabled():
+        return
+    eng = _get_engine()
+    with eng.begin() as con:
+        con.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS treinos (
+            id TEXT PRIMARY KEY,
+            data DATE,
+            nome TEXT,
+            grupo_muscular TEXT,
+            exercicio TEXT,
+            series REAL,
+            repeticoes REAL,
+            carga_kg REAL,
+            observacoes TEXT
+        );
+        """))
+        con.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS avaliacoes (
+            id TEXT PRIMARY KEY
+        );
+        """))
+
+def _db_upsert_df(table: str, df: pd.DataFrame):
+    """Simple upsert by deleting IDs then inserting."""
+    if not _db_enabled():
+        return
+    if df.empty or "ID" not in df.columns:
+        return
+    eng = _get_engine()
+    ids = df["ID"].astype(str).tolist()
+    with eng.begin() as con:
+        con.execute(sql_text(f"DELETE FROM {table} WHERE id = ANY(:ids)"), {"ids": ids})
+    # pandas will map columns, ensure id column name is id for db
+    df2 = df.copy()
+    if table == "treinos":
+        df2 = df2.rename(columns={
+            "ID": "id",
+            "Data": "data",
+            "Nome": "nome",
+            "Grupo muscular": "grupo_muscular",
+            "Exercicio": "exercicio",
+            "Series": "series",
+            "Repeticoes": "repeticoes",
+            "Carga (kg)": "carga_kg",
+            "Observacoes": "observacoes",
+        })
+    df2.to_sql(table, eng, if_exists="append", index=False)
+
+def _db_read_df(table: str) -> pd.DataFrame:
+    if not _db_enabled():
+        return pd.DataFrame()
+    _db_init_tables()
+    eng = _get_engine()
+    q = f"SELECT * FROM {table}"
+    df = pd.read_sql(q, eng)
+    if table == "treinos" and not df.empty:
+        df = df.rename(columns={
+            "id": "ID",
+            "data": "Data",
+            "nome": "Nome",
+            "grupo_muscular": "Grupo muscular",
+            "exercicio": "Exercicio",
+            "series": "Series",
+            "repeticoes": "Repeticoes",
+            "carga_kg": "Carga (kg)",
+            "observacoes": "Observacoes",
+        })
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+    return df
+
+def _sql_write_replace(df: pd.DataFrame, table: str):
+    """Replace total (util para backup/edit)."""
+    if not _db_enabled():
+        return
+    _db_init_tables()
+    eng = _get_engine()
+    df2 = df.copy()
+    if table == 'treinos' and not df2.empty:
+        df2 = df2.rename(columns={
+            'ID': 'id',
+            'Data': 'data',
+            'Nome': 'nome',
+            'Grupo muscular': 'grupo_muscular',
+            'Exercicio': 'exercicio',
+            'Series': 'series',
+            'Repeticoes': 'repeticoes',
+            'Carga (kg)': 'carga_kg',
+            'Observacoes': 'observacoes',
+        })
+    df2.to_sql(table, eng, if_exists='replace', index=False)
 
 
 def _kpi_delta(series: pd.Series):
@@ -114,52 +220,7 @@ def _current_value(series: pd.Series):
     return float(s.iloc[-1])
 
 
-def _make_pdf_from_table(title: str, df: pd.DataFrame) -> bytes:
-    """Simple PDF export for the current ficha."""
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-
-    x0, y = 40, h - 50
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x0, y, title)
-    y -= 25
-
-    c.setFont("Helvetica", 9)
-    cols = list(df.columns)
-    # Column widths (rough)
-    col_w = [70, 70, 90, 120, 40, 55, 55]
-    col_w = col_w[: len(cols)]
-    if len(col_w) < len(cols):
-        col_w += [80] * (len(cols) - len(col_w))
-
-    # Header
-    for i, col in enumerate(cols):
-        c.drawString(x0 + sum(col_w[:i]), y, str(col)[:18])
-    y -= 14
-
-    # Rows
-    for _, row in df.iterrows():
-        if y < 60:
-            c.showPage()
-            y = h - 50
-            c.setFont("Helvetica", 9)
-        for i, col in enumerate(cols):
-            val = row.get(col, "")
-            c.drawString(x0 + sum(col_w[:i]), y, str(val)[:20])
-        y -= 12
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
 def _to_float_or_none(x, treat_zero_as_none: bool = False):
-    """Parse float; return None on blanks/invalid.
-
-    Streamlit number_input retorna 0.0 por padrão. Para medidas corporais,
-    normalmente 0 indica 'não preenchido'. Use treat_zero_as_none=True nesses casos.
-    """
     try:
         if x is None:
             return None
@@ -182,7 +243,6 @@ def _calc_imc(peso: float | None, altura: float | None) -> float | None:
 def _classificacao_imc(imc: float | None) -> str | None:
     if imc is None:
         return None
-    # Mantém nomenclatura comum (e bate com o exemplo da planilha)
     if imc < 18.5:
         return "Baixo peso"
     if imc < 25:
@@ -196,8 +256,15 @@ def _classificacao_imc(imc: float | None) -> str | None:
     return "Obesidade Grau III"
 
 
-def _calc_dc_jp3(sexo: str | None, idade: float | None, d_pe: float | None, d_ab: float | None,
-                d_cx: float | None, d_si: float | None, d_tr: float | None) -> float | None:
+def _calc_dc_jp3(
+    sexo: str | None,
+    idade: float | None,
+    d_pe: float | None,
+    d_ab: float | None,
+    d_cx: float | None,
+    d_si: float | None,
+    d_tr: float | None,
+) -> float | None:
     """Densidade corporal (Jackson & Pollock 3 dobras).
 
     Homem: Peitoral + Abdominal + Coxa
@@ -213,14 +280,13 @@ def _calc_dc_jp3(sexo: str | None, idade: float | None, d_pe: float | None, d_ab
         if any(v is None for v in vals):
             return None
         s = sum(vals)
-        return 1.10938 - 0.0008267 * s + 0.0000016 * (s ** 2) - 0.0002574 * idade
+        return 1.10938 - 0.0008267 * s + 0.0000016 * (s**2) - 0.0002574 * idade
 
-    # Mulher
     vals = [d_tr, d_si, d_cx]
     if any(v is None for v in vals):
         return None
     s = sum(vals)
-    return 1.0994921 - 0.0009929 * s + 0.0000023 * (s ** 2) - 0.0001392 * idade
+    return 1.0994921 - 0.0009929 * s + 0.0000023 * (s**2) - 0.0001392 * idade
 
 
 def _calc_gordura_siri(dc: float | None) -> float | None:
@@ -230,15 +296,13 @@ def _calc_gordura_siri(dc: float | None) -> float | None:
 
 
 def _calc_rcq(cc: float | None, cq: float | None) -> float | None:
-    if cc is None or cq is None:
-        return None
-    if cq <= 0:
+    if cc is None or cq is None or cq <= 0:
         return None
     return cc / cq
 
 
 def _classificacao_rcq(sexo: str | None, rcq: float | None) -> str | None:
-    """Classificação de risco (padrão OMS, simplificado em 3 níveis)."""
+    """Classificação de risco (OMS simplificada)."""
     if rcq is None or sexo not in {"Homem", "Mulher"}:
         return None
     if sexo == "Homem":
@@ -247,7 +311,7 @@ def _classificacao_rcq(sexo: str | None, rcq: float | None) -> str | None:
         if rcq < 1.00:
             return "Risco Moderado"
         return "Alto Risco"
-    # Mulher
+
     if rcq < 0.80:
         return "Baixo Risco"
     if rcq < 0.85:
@@ -255,13 +319,247 @@ def _classificacao_rcq(sexo: str | None, rcq: float | None) -> str | None:
     return "Alto Risco"
 
 
-# ---------------------------
-# Sidebar: Load file + filters
-# ---------------------------
+def _recompute_derived(row: dict, base_cols: list[str]) -> dict:
+    """Recalcula campos derivados para uma linha de avaliação."""
+    out = {c: row.get(c) for c in base_cols}
+
+    sexo = out.get("Sexo")
+    idade = _to_float_or_none(out.get("Idade"), treat_zero_as_none=True)
+    peso = _to_float_or_none(out.get("Peso"), treat_zero_as_none=True)
+    altura = _to_float_or_none(out.get("Altura"), treat_zero_as_none=True)
+
+    d_pe = _to_float_or_none(out.get("D PE"), treat_zero_as_none=True)
+    d_ab = _to_float_or_none(out.get("D AB"), treat_zero_as_none=True)
+    d_cx = _to_float_or_none(out.get("D CX"), treat_zero_as_none=True)
+    d_si = _to_float_or_none(out.get("D SI"), treat_zero_as_none=True)
+    d_tr = _to_float_or_none(out.get("D TR"), treat_zero_as_none=True)
+
+    cc = _to_float_or_none(out.get("CC"), treat_zero_as_none=True)
+    cq = _to_float_or_none(out.get("CQ"), treat_zero_as_none=True)
+
+    imc = _calc_imc(peso, altura)
+    out["IMC"] = imc
+    if "Classificação IMC" in base_cols:
+        out["Classificação IMC"] = _classificacao_imc(imc)
+
+    dc = _calc_dc_jp3(sexo, idade, d_pe, d_ab, d_cx, d_si, d_tr)
+    if "DC" in base_cols:
+        out["DC"] = dc
+
+    gordura = _calc_gordura_siri(dc)
+    if "G" in base_cols:
+        out["G"] = gordura
+    if "% Gordura" in base_cols and gordura is not None:
+        out["% Gordura"] = gordura
+
+    if "MM" in base_cols and gordura is not None:
+        out["MM"] = 100 - gordura
+    if "% Massa Magra" in base_cols and gordura is not None:
+        out["% Massa Magra"] = 100 - gordura
+
+    rcq = _calc_rcq(cc, cq)
+    out["RCQ"] = rcq
+    out["RISCO"] = _classificacao_rcq(sexo, rcq)
+
+    return out
+
+
+def _make_pdf_from_table(title: str, df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    x0, y = 40, h - 50
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x0, y, title)
+    y -= 25
+
+    c.setFont("Helvetica", 9)
+    cols = list(df.columns)
+    col_w = [70, 80, 90, 140, 40, 55, 55, 80]
+    col_w = col_w[: len(cols)]
+    if len(col_w) < len(cols):
+        col_w += [80] * (len(cols) - len(col_w))
+
+    for i, col in enumerate(cols):
+        c.drawString(x0 + sum(col_w[:i]), y, str(col)[:18])
+    y -= 14
+
+    for _, row in df.iterrows():
+        if y < 60:
+            c.showPage()
+            y = h - 50
+            c.setFont("Helvetica", 9)
+        for i, col in enumerate(cols):
+            val = row.get(col, "")
+            c.drawString(x0 + sum(col_w[:i]), y, str(val)[:24])
+        y -= 12
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+def _make_pdf_report(nome: str, periodo: tuple, kpis: dict, rcq_table: pd.DataFrame) -> bytes:
+    """PDF simples: KPIs + RCQ/Risco (texto)."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    x0, y = 40, h - 50
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x0, y, "Relatorio - App Personal")
+    y -= 24
+
+    c.setFont("Helvetica", 10)
+    c.drawString(x0, y, f"Nome: {nome}")
+    y -= 14
+    c.drawString(x0, y, f"Periodo: {periodo[0]} a {periodo[1]}")
+    y -= 20
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x0, y, "KPIs")
+    y -= 16
+    c.setFont("Helvetica", 10)
+    for label, (val, delta, unit) in kpis.items():
+        c.drawString(x0, y, f"- {label}: {val}{unit} (variacao: {delta}{unit})")
+        y -= 14
+        if y < 90:
+            c.showPage()
+            y = h - 50
+            c.setFont("Helvetica", 10)
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x0, y, "RCQ e Risco")
+    y -= 16
+    c.setFont("Helvetica", 10)
+    if rcq_table is None or rcq_table.empty:
+        c.drawString(x0, y, "Sem dados de RCQ no periodo selecionado.")
+    else:
+        cols = [c for c in ["Data", "RCQ", "RISCO"] if c in rcq_table.columns]
+        for _, row in rcq_table[cols].head(15).iterrows():
+            c.drawString(x0, y, f"{row.get('Data','')}  RCQ: {row.get('RCQ','')}  Risco: {row.get('RISCO','')}")
+            y -= 14
+            if y < 70:
+                c.showPage()
+                y = h - 50
+                c.setFont("Helvetica", 10)
+
+    c.save()
+    return buf.getvalue()
+
+
+
+def _make_backup_zip(avaliacoes_df: pd.DataFrame, treinos_df: pd.DataFrame) -> bytes:
+    """Gera um ZIP com CSV + Excel das bases atuais."""
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        # CSVs
+        z.writestr('avaliacoes.csv', avaliacoes_df.to_csv(index=False))
+        z.writestr('treinos.csv', treinos_df.to_csv(index=False))
+        # Excel
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
+            avaliacoes_df.to_excel(writer, index=False, sheet_name='AVALIACOES')
+            treinos_df.to_excel(writer, index=False, sheet_name='TREINOS')
+        z.writestr('backup_app_personal.xlsx', xbuf.getvalue())
+    return zbuf.getvalue()
+
+
+
+def _read_registro() -> pd.DataFrame:
+    # Banco (se configurado)
+    if _db_enabled():
+        df = _db_read_df("treinos")
+    else:
+        df = _read_csv(REGISTRO_PATH)
+
+    if df.empty:
+        df = pd.DataFrame(
+            columns=[
+                "ID",
+                "Data",
+                "Nome",
+                "Grupo muscular",
+                "Exercicio",
+                "Series",
+                "Repeticoes",
+                "Carga (kg)",
+                "Observacoes",
+            ]
+        )
+
+    # padroniza
+    if "Data" in df.columns:
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+    df = _ensure_id(df)
+    return df
+
+
+def _save_registro(df: pd.DataFrame):
+    df = df.copy()
+    if "Data" in df.columns:
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+    df = _ensure_id(df)
+
+    if _db_enabled():
+        _db_init_tables()
+        # replace total (simples e confiavel)
+        _sql_write_replace(df, "treinos")
+    else:
+        _write_csv(df, REGISTRO_PATH)
+
+
+def _append_registro(rows: list[dict]):
+    df_old = _read_registro()
+    df_new = pd.DataFrame(rows)
+    # garantir colunas
+    for col in df_old.columns:
+        if col not in df_new.columns:
+            df_new[col] = None
+    if "ID" not in df_new.columns:
+        df_new["ID"] = None
+    df_all = pd.concat([df_old, df_new[df_old.columns]], ignore_index=True)
+    _save_registro(df_all)
+
+
+def _load_or_init_avaliacoes_db(avaliacao_xlsx: pd.DataFrame) -> pd.DataFrame:
+    """DB editável: se não existir, inicializa com a planilha."""
+    if os.path.exists(AVALIACOES_DB_PATH):
+        db = pd.read_csv(AVALIACOES_DB_PATH)
+        db = _to_date_col(db, "Data")
+        db = _ensure_id(db)
+        return db
+
+    base = avaliacao_xlsx.copy()
+    base = _to_date_col(base, "Data")
+    base = _ensure_id(base)
+    _write_csv(base, AVALIACOES_DB_PATH)
+    return base
+
+
+def _save_avaliacoes_db(df: pd.DataFrame):
+    df = df.copy()
+    if "Data" in df.columns:
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+    _write_csv(df, AVALIACOES_DB_PATH)
+
+
+# -------------------------------------------------
+# Sidebar (Tema, Login opcional, Excel, filtros)
+# -------------------------------------------------
 
 st.sidebar.title("App Personal")
 
-# Tema (mudança de cor via CSS)
+# Login opcional por senha (secrets / env). Se não definido, fica liberado.
+with st.sidebar.expander("Acesso (opcional)"):
+    senha_req = os.getenv("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", None) if hasattr(st, "secrets") else None
+    senha_in = st.text_input("Senha (se estiver configurada)", type="password")
+    if senha_req:
+        if senha_in != senha_req:
+            st.sidebar.warning("Senha necessária para usar o app.")
+    
+# Tema
 tema = st.sidebar.selectbox(
     "Tema do dashboard",
     ["Escuro (padrão)", "Claro", "Azul", "Verde"],
@@ -272,17 +570,13 @@ THEMES_CSS = {
     "Escuro (padrão)": "",
     "Claro": """
         <style>
-        /* Tema claro com contraste alto */
-        .stApp { background: #ffffff; color: #111111; }
-        [data-testid="stHeader"] { background: rgba(255,255,255,0.85); }
-        /* Textos e labels (evita sobrescrever cores de delta) */
+        .stApp { background: #ffffff; }
         body, p, span, div, label, h1, h2, h3, h4, h5, h6 { color: #111111; }
-        [data-testid="stMetricLabel"],
-        [data-testid="stMetricValue"] { color: #111111 !important; }
-        /* Mantém cor do delta (verde/vermelho) */
-        [data-testid="stMetricDelta"] { filter: none; }
-        /* Tabelas/DF */
+        [data-testid="stHeader"] { background: rgba(255,255,255,0.90); }
+        [data-testid="stMetricLabel"], [data-testid="stMetricValue"] { color: #111111 !important; }
         [data-testid="stDataFrame"] * { color: #111111 !important; }
+        /* links */
+        a { color: #0b57d0 !important; }
         </style>
     """,
     "Azul": """
@@ -299,15 +593,33 @@ THEMES_CSS = {
     """,
 }
 
-# Plotly template por tema
 PLOTLY_TEMPLATE = "plotly_white" if tema == "Claro" else "plotly_dark"
 
 st.markdown(THEMES_CSS.get(tema, ""), unsafe_allow_html=True)
 
+# Layout compacto (bom para celular)
+modo_mobile = st.sidebar.toggle("Modo celular (layout compacto)", value=st.session_state.get("modo_mobile", False))
+st.session_state["modo_mobile"] = modo_mobile
+
+with st.sidebar.expander("Backup e exportacao"):
+    st.caption("Baixe um backup das bases (avaliacoes + treinos) ja com edicoes/exclusoes.")
+    try:
+        _bk = _make_backup_zip(avaliacao_db if "avaliacao_db" in locals() else pd.DataFrame(), _read_registro())
+        st.download_button("Baixar backup (ZIP)", data=_bk, file_name=BACKUP_ZIP_NAME, mime="application/zip")
+    except Exception as _e:
+        st.info("Backup ficara disponivel apos carregar os dados.")
+
+with st.sidebar.expander("Banco de dados (opcional)"):
+    if _db_enabled():
+        st.success("Banco configurado: usando DATABASE_URL")
+    else:
+        st.warning("Sem banco configurado: usando arquivos CSV locais")
+    st.caption("Se quiser usar Supabase/Neon/Postgres, configure DATABASE_URL em Settings > Secrets no Streamlit Cloud.")
+
 uploaded = st.sidebar.file_uploader(
     "Envie o Excel (APP PERSONAL.xlsx)",
     type=["xlsx"],
-    help="Se voce nao enviar, o app tenta carregar o arquivo que estiver junto do app (APP PERSONAL.xlsx).",
+    help="Se você não enviar, o app tenta carregar o arquivo padrão (APP PERSONAL.xlsx).",
 )
 
 try:
@@ -316,79 +628,96 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-# Expected sheets
-avaliacao = sheets.get("AVALIACAO_FISICA", pd.DataFrame()).copy()
+avaliacao_xlsx = sheets.get("AVALIACAO_FISICA", pd.DataFrame()).copy()
 dados_treinos = sheets.get("DADOS_TREINOS", pd.DataFrame()).copy()
 
-# Normalize avaliacao
-if not avaliacao.empty and "Data" in avaliacao.columns:
-    avaliacao["Data"] = _safe_to_datetime(avaliacao["Data"]).dt.date
+if avaliacao_xlsx.empty:
+    st.error("A aba 'AVALIACAO_FISICA' não foi encontrada ou está vazia.")
+    st.stop()
 
-# Mescla avaliações extras criadas via app
-av_extra = _read_avaliacoes_extra()
-if not av_extra.empty:
-    # alinhar colunas entre base e extra
-    for col in avaliacao.columns:
-        if col not in av_extra.columns:
-            av_extra[col] = None
-    for col in av_extra.columns:
-        if col not in avaliacao.columns:
-            avaliacao[col] = None
-    avaliacao = pd.concat([avaliacao[av_extra.columns], av_extra[av_extra.columns]], ignore_index=True)
-    if "Data" in avaliacao.columns:
-        avaliacao["Data"] = pd.to_datetime(avaliacao["Data"], errors="coerce").dt.date
+# DB editável
+avaliacao_db = _load_or_init_avaliacoes_db(avaliacao_xlsx)
 
-# Name filter
-nomes = []
-if not avaliacao.empty and "Nome" in avaliacao.columns:
-    nomes = sorted([x for x in avaliacao["Nome"].dropna().unique().tolist() if str(x).strip()])
+# Se o usuário subir um Excel diferente e quiser reiniciar a base
+with st.sidebar.expander("Configurações avançadas"):
+    if st.button("Reinicializar avaliações com o Excel enviado"):
+        base = _ensure_id(_to_date_col(avaliacao_xlsx.copy(), "Data"))
+        _save_avaliacoes_db(base)
+        st.success("Base de avaliações reinicializada.")
+        st.rerun()
+
+# filtros
+avaliacao_db = _to_date_col(avaliacao_db, "Data")
+
+nomes = sorted([x for x in avaliacao_db.get("Nome", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x.strip()])
 
 nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
 
-# Date range filter
-if not avaliacao.empty and "Data" in avaliacao.columns and avaliacao["Data"].notna().any():
-    dmin = avaliacao["Data"].min()
-    dmax = avaliacao["Data"].max()
-    dr = st.sidebar.date_input("Periodo", (dmin, dmax), min_value=dmin, max_value=dmax)
+# Período rápido
+if avaliacao_db["Data"].notna().any():
+    dmax = avaliacao_db["Data"].max()
+    dmin = avaliacao_db["Data"].min()
+else:
+    dmax = date.today()
+    dmin = dmax
+
+periodo_rapido = st.sidebar.selectbox(
+    "Período rápido",
+    ["Personalizado", "Últimos 30 dias", "Últimos 60 dias", "Últimos 90 dias", "Ano atual", "Tudo"],
+    index=0,
+)
+
+if periodo_rapido == "Últimos 30 dias":
+    d_start, d_end = dmax - timedelta(days=30), dmax
+elif periodo_rapido == "Últimos 60 dias":
+    d_start, d_end = dmax - timedelta(days=60), dmax
+elif periodo_rapido == "Últimos 90 dias":
+    d_start, d_end = dmax - timedelta(days=90), dmax
+elif periodo_rapido == "Ano atual":
+    d_start, d_end = date(dmax.year, 1, 1), dmax
+elif periodo_rapido == "Tudo":
+    d_start, d_end = dmin, dmax
+else:
+    dr = st.sidebar.date_input("Período", (dmin, dmax), min_value=dmin, max_value=dmax)
     if isinstance(dr, tuple) and len(dr) == 2:
         d_start, d_end = dr
     else:
         d_start, d_end = dmin, dmax
-else:
-    d_start = d_end = None
 
+# Aplicar filtros
+av = avaliacao_db.copy()
+if "Nome" in av.columns and nomes:
+    av = av[av["Nome"] == nome_sel]
+if "Data" in av.columns:
+    av = av[(av["Data"] >= d_start) & (av["Data"] <= d_end)]
 
-# Filtered avaliacao
-av = avaliacao.copy()
-if not av.empty:
-    if "Nome" in av.columns and nomes:
-        av = av[av["Nome"] == nome_sel]
-    if d_start and d_end and "Data" in av.columns:
-        av = av[(av["Data"] >= d_start) & (av["Data"] <= d_end)]
-    av = av.sort_values("Data")
+av = av.sort_values("Data")
 
+# -------------------------------------------------
+# Tabs
+# -------------------------------------------------
 
-# ---------------------------
-# Main UI (Tabs)
-# ---------------------------
+tab_dash, tab_av, tab_ficha, tab_reg = st.tabs([
+    "Dashboard",
+    "Avaliação Física",
+    "Ficha de treino",
+    "Registro de treinos",
+])
 
-tab1, tab_av, tab2, tab3 = st.tabs(["Dashboard", "Avaliação Física", "Ficha de treino", "Registro de treinos"])
-
-# ===============
-# Tab 1: Dashboard
-# ===============
-with tab1:
+# -----------------
+# Dashboard
+# -----------------
+with tab_dash:
     st.subheader("Dashboard")
 
     if av.empty:
-        st.info("Nenhum dado encontrado em AVALIACAO_FISICA para os filtros atuais.")
+        st.info("Nenhum dado encontrado para os filtros atuais.")
     else:
-        # Identify columns
+        # escolher colunas
         col_peso = "Peso" if "Peso" in av.columns else None
-        col_gord = "G" if "G" in av.columns else ("% Gordura" if "% Gordura" in av.columns else None)
+        col_g = "G" if "G" in av.columns else ("% Gordura" if "% Gordura" in av.columns else None)
         col_mm = "MM" if "MM" in av.columns else ("% Massa Magra" if "% Massa Magra" in av.columns else None)
 
-        # KPIs (valor atual em cima, variação embaixo)
         k1, k2, k3, k4, k5 = st.columns(5)
 
         if col_peso:
@@ -398,9 +727,9 @@ with tab1:
         else:
             k1.metric("Peso (atual)", "-")
 
-        if col_gord:
-            g_atual = _current_value(av[col_gord])
-            delta_g = _kpi_delta(av[col_gord])
+        if col_g:
+            g_atual = _current_value(av[col_g])
+            delta_g = _kpi_delta(av[col_g])
             k2.metric("% Gordura (atual)", f"{g_atual:.2f} %" if g_atual is not None else "-", _fmt_delta(delta_g, " %"))
         else:
             k2.metric("% Gordura (atual)", "-")
@@ -421,20 +750,27 @@ with tab1:
 
         if "RCQ" in av.columns and av["RCQ"].notna().any():
             rcq_atual = float(pd.to_numeric(av["RCQ"], errors="coerce").dropna().iloc[-1])
-            risco_atual = (
-                av["RISCO"].dropna().iloc[-1]
-                if "RISCO" in av.columns and av["RISCO"].notna().any()
-                else "-"
-            )
+            risco_atual = av["RISCO"].dropna().iloc[-1] if "RISCO" in av.columns and av["RISCO"].notna().any() else "-"
             k5.metric("RCQ (atual)", f"{rcq_atual:.2f}", str(risco_atual), delta_color="off")
         else:
             k5.metric("RCQ (atual)", "-")
 
+        # Relatorio PDF (Dashboard)
+        kpis_report = {
+            'Peso': (f'{peso_atual:.2f}' if 'peso_atual' in locals() and peso_atual is not None else '-', _fmt_delta(delta_peso, ''), ' kg'),
+            '% Gordura': (f'{g_atual:.2f}' if 'g_atual' in locals() and g_atual is not None else '-', _fmt_delta(delta_g, ''), ' %'),
+            '% Massa magra': (f'{mm_atual:.2f}' if 'mm_atual' in locals() and mm_atual is not None else '-', _fmt_delta(delta_mm, ''), ' %'),
+            'IMC': (f'{imc_atual:.2f}' if 'imc_atual' in locals() and imc_atual is not None else '-', _fmt_delta(delta_imc, ''), ''),
+            'RCQ': (f'{rcq_atual:.2f}' if 'rcq_atual' in locals() and rcq_atual is not None else '-', '-', ''),
+        }
+        rcq_tbl = av[[c for c in ['Data','RCQ','RISCO'] if c in av.columns]].copy() if 'av' in locals() else pd.DataFrame()
+        pdf_rel = _make_pdf_report(str(nome_sel), (data_i, data_f), kpis_report, rcq_tbl)
+        st.download_button('Exportar relatorio (PDF)', data=pdf_rel, file_name=f'relatorio_{nome_sel}.pdf', mime='application/pdf')
+
         st.divider()
 
-        # Gráficos em quadros
-        g1, g2 = st.columns(2)
-        with g1:
+        c1, c2 = st.columns(2)
+        with c1:
             with st.container(border=True):
                 if col_peso:
                     fig = px.line(av, x="Data", y=col_peso, markers=True, title="Peso ao longo do tempo", template=PLOTLY_TEMPLATE)
@@ -443,13 +779,13 @@ with tab1:
                     st.info("Coluna de peso não encontrada.")
 
             with st.container(border=True):
-                if col_gord:
-                    fig = px.line(av, x="Data", y=col_gord, markers=True, title="% Gordura ao longo do tempo", template=PLOTLY_TEMPLATE)
+                if col_g:
+                    fig = px.line(av, x="Data", y=col_g, markers=True, title="% Gordura ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Coluna de % gordura não encontrada.")
 
-        with g2:
+        with c2:
             with st.container(border=True):
                 if col_mm:
                     fig = px.line(av, x="Data", y=col_mm, markers=True, title="% Massa magra ao longo do tempo", template=PLOTLY_TEMPLATE)
@@ -460,26 +796,14 @@ with tab1:
             with st.container(border=True):
                 circ_cols = [c for c in ["CC", "CQ", "CA"] if c in av.columns]
                 if circ_cols:
-                    df_melt = av[["Data"] + circ_cols].melt(
-                        id_vars=["Data"],
-                        var_name="Circunferência",
-                        value_name="Valor",
-                    )
-                    fig = px.line(
-                        df_melt,
-                        x="Data",
-                        y="Valor",
-                        color="Circunferência",
-                        markers=True,
-                        title="Circunferências ao longo do tempo",
-                        template=PLOTLY_TEMPLATE,
-                    )
+                    df_melt = av[["Data"] + circ_cols].melt(id_vars=["Data"], var_name="Circunferência", value_name="Valor")
+                    fig = px.line(df_melt, x="Data", y="Valor", color="Circunferência", markers=True, title="Circunferências ao longo do tempo", template=PLOTLY_TEMPLATE)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Circunferências (CC/CQ/CA) não encontradas.")
 
-        g3, g4 = st.columns(2)
-        with g3:
+        c3, c4 = st.columns(2)
+        with c3:
             with st.container(border=True):
                 if "RCQ" in av.columns:
                     fig = px.line(av, x="Data", y="RCQ", markers=True, title="RCQ ao longo do tempo", template=PLOTLY_TEMPLATE)
@@ -487,330 +811,490 @@ with tab1:
                 else:
                     st.info("Coluna RCQ não encontrada.")
 
-        with g4:
+        with c4:
             with st.container(border=True):
                 st.markdown("#### Quadro RCQ e risco")
-                rcq_cols = [c for c in ["Data", "RCQ", "RISCO"] if c in av.columns]
-                if "RCQ" in rcq_cols:
-                    df_rcq = av[rcq_cols].copy()
-                    st.dataframe(df_rcq, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Coluna RCQ/RISCO não encontrada.")
+                cols = [c for c in ["Data", "RCQ", "RISCO"] if c in av.columns]
+                st.dataframe(av[cols], use_container_width=True, hide_index=True)
 
-
-# =======================
-# Tab Avaliação Física
-# =======================
+# -----------------
+# Avaliação Física
+# -----------------
 with tab_av:
     st.subheader("Avaliação Física")
 
-    # ----- Criar nova avaliação -----
-    if not avaliacao.empty and "Data" in avaliacao.columns and "Nome" in avaliacao.columns:
-        with st.expander("Adicionar nova avaliação"):
-            with st.form("form_nova_avaliacao", border=True):
+    # tabela (respeita filtros)
+    st.caption("A tabela abaixo respeita os filtros de Nome e Período da barra lateral.")
+
+    # seleção múltipla para excluir
+    av_view = av.copy()
+    if not av_view.empty:
+        av_view.insert(0, "Selecionar", False)
+        edited = st.data_editor(
+            av_view,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[c for c in av_view.columns if c not in {"Selecionar"}],
+            key="editor_av",
+        )
+        selected_ids = edited.loc[edited["Selecionar"] == True, "ID"].astype(str).tolist()
+
+        b1, b2, b3 = st.columns([1, 1, 2])
+        with b1:
+            if st.button("Excluir selecionadas", disabled=len(selected_ids) == 0):
+                st.session_state["confirm_delete"] = True
+        with b2:
+            if st.button("Exportar base atual (Excel)"):
+                # exporta todas as avaliações do DB (não só filtradas)
+                db = avaliacao_db.copy()
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                    db.to_excel(writer, index=False, sheet_name="AVALIACAO_FISICA")
+                st.download_button(
+                    "Baixar Excel (base completa)",
+                    data=out.getvalue(),
+                    file_name="avaliacoes_atualizadas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        with b3:
+            st.write("")
+
+        if st.session_state.get("confirm_delete"):
+            st.warning(f"Confirmar exclusão de {len(selected_ids)} avaliação(ões)?")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Confirmar exclusão"):
+                    db = avaliacao_db.copy()
+                    db = db[~db["ID"].astype(str).isin([str(x) for x in selected_ids])]
+                    _save_avaliacoes_db(db)
+                    st.success("Avaliações excluídas.")
+                    st.session_state["confirm_delete"] = False
+                    st.rerun()
+            with c2:
+                if st.button("Cancelar"):
+                    st.session_state["confirm_delete"] = False
+
+    else:
+        st.info("Nenhuma avaliação para mostrar.")
+
+    st.divider()
+
+    # --------- Adicionar nova avaliação ---------
+    with st.expander("Adicionar nova avaliação"):
+        base_cols = avaliacao_db.columns.tolist()
+
+        with st.form("form_nova_avaliacao", border=True):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                nome_novo = st.text_input("Nome", value=nome_sel if nome_sel != "(sem nomes)" else "")
+            with c2:
+                data_nova = st.date_input("Data", value=date.today())
+            with c3:
+                sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0)
+
+            # inputs principais
+            r1 = st.columns(4)
+            peso = r1[0].number_input("Peso (kg)", min_value=0.0, step=0.1, value=0.0)
+            altura = r1[1].number_input("Altura (m)", min_value=0.0, step=0.01, value=0.0)
+            idade = r1[2].number_input("Idade", min_value=0, step=1, value=0)
+            obs = r1[3].text_input("Observações", value="") if "Observacoes" in base_cols else ""
+
+            st.markdown("**Dobras cutâneas (mm)**")
+            d1 = st.columns(5)
+            d_pe = d1[0].number_input("D PE (peitoral)", min_value=0.0, step=0.1, value=0.0)
+            d_ab = d1[1].number_input("D AB (abdominal)", min_value=0.0, step=0.1, value=0.0)
+            d_cx = d1[2].number_input("D CX (coxa)", min_value=0.0, step=0.1, value=0.0)
+            d_si = d1[3].number_input("D SI (supra-ilíaca)", min_value=0.0, step=0.1, value=0.0)
+            d_tr = d1[4].number_input("D TR (tríceps)", min_value=0.0, step=0.1, value=0.0)
+
+            st.markdown("**Circunferências (cm)**")
+            ccs = st.columns(4)
+            cc = ccs[0].number_input("CC (cintura)", min_value=0.0, step=0.1, value=0.0)
+            cq = ccs[1].number_input("CQ (quadril)", min_value=0.0, step=0.1, value=0.0)
+            ca = ccs[2].number_input("CA (abdômen)", min_value=0.0, step=0.1, value=0.0)
+            # RCQ calculado, mas deixo visível
+            rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
+
+            submitted = st.form_submit_button("Salvar avaliação")
+
+        if submitted:
+            if not nome_novo.strip():
+                st.error("Preencha o Nome.")
+            elif sexo_val not in {"Homem", "Mulher"}:
+                st.error("Selecione o Sexo.")
+            else:
+                row = {c: None for c in base_cols}
+                row["Nome"] = nome_novo.strip()
+                row["Data"] = data_nova
+                row["Sexo"] = sexo_val
+
+                row["Peso"] = _to_float_or_none(peso, treat_zero_as_none=True)
+                row["Altura"] = _to_float_or_none(altura, treat_zero_as_none=True)
+                row["Idade"] = _to_float_or_none(idade, treat_zero_as_none=True)
+
+                row["D PE"] = _to_float_or_none(d_pe, treat_zero_as_none=True)
+                row["D AB"] = _to_float_or_none(d_ab, treat_zero_as_none=True)
+                row["D CX"] = _to_float_or_none(d_cx, treat_zero_as_none=True)
+                row["D SI"] = _to_float_or_none(d_si, treat_zero_as_none=True)
+                row["D TR"] = _to_float_or_none(d_tr, treat_zero_as_none=True)
+
+                row["CC"] = _to_float_or_none(cc, treat_zero_as_none=True)
+                row["CQ"] = _to_float_or_none(cq, treat_zero_as_none=True)
+                row["CA"] = _to_float_or_none(ca, treat_zero_as_none=True)
+
+                if "Observacoes" in base_cols:
+                    row["Observacoes"] = obs
+
+                row = _recompute_derived(row, base_cols)
+
+                # ID
+                row["ID"] = str(abs(hash(f"{row['Nome']}|{row['Data']}|{os.urandom(6).hex()}")))
+
+                db = avaliacao_db.copy()
+                db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
+                db = _ensure_id(db)
+                _save_avaliacoes_db(db)
+
+                st.success("Avaliação salva.")
+                st.rerun()
+
+    st.divider()
+
+    # --------- Editar avaliação ---------
+    with st.expander("Editar avaliação"):
+        if av.empty:
+            st.info("Nenhuma avaliação no filtro atual para editar.")
+        else:
+            # selecionar por ID
+            options = av[["ID", "Data"]].copy()
+            options["label"] = options["Data"].astype(str) + " | ID " + options["ID"].astype(str)
+            label_to_id = dict(zip(options["label"], options["ID"]))
+            sel_label = st.selectbox("Selecione a avaliação", list(label_to_id.keys()))
+            sel_id = str(label_to_id[sel_label])
+
+            base_cols = avaliacao_db.columns.tolist()
+            row0 = avaliacao_db[avaliacao_db["ID"].astype(str) == sel_id].iloc[0].to_dict()
+
+            with st.form("form_edit_av", border=True):
                 c1, c2, c3 = st.columns([2, 1, 1])
-                with c1:
-                    nome_novo = st.text_input("Nome", value=nome_sel if nome_sel and nome_sel != "(sem nomes)" else "")
-                with c2:
-                    data_nova = st.date_input("Data", value=date.today())
-                with c3:
-                    sexo_col = "Sexo" if "Sexo" in avaliacao.columns else None
-                    sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0) if sexo_col else None
+                c1.text_input("Nome", value=str(row0.get("Nome", "")), key="edit_nome")
+                c2.date_input("Data", value=pd.to_datetime(row0.get("Data"), errors="coerce").date(), key="edit_data")
+                c3.selectbox("Sexo", ["Homem", "Mulher"], index=0 if row0.get("Sexo") == "Homem" else 1, key="edit_sexo")
 
-                # --- Entradas completas, seguindo a planilha ---
-                # Dados pessoais / antropometria
-                p1, p2, p3, p4 = st.columns(4)
-                with p1:
-                    idade = st.number_input("Idade", value=0, step=1) if "Idade" in avaliacao.columns else None
-                with p2:
-                    peso = st.number_input("Peso (kg)", value=0.0, step=0.1) if "Peso" in avaliacao.columns else None
-                with p3:
-                    altura = st.number_input("Altura (m)", value=0.0, step=0.01) if "Altura" in avaliacao.columns else None
-                with p4:
-                    cc = st.number_input("CC (cintura)", value=0.0, step=0.1) if "CC" in avaliacao.columns else None
-
-                p5, p6, p7, p8 = st.columns(4)
-                with p5:
-                    cq = st.number_input("CQ (quadril)", value=0.0, step=0.1) if "CQ" in avaliacao.columns else None
-                with p6:
-                    ca = st.number_input("CA (abdômen)", value=0.0, step=0.1) if "CA" in avaliacao.columns else None
-                with p7:
-                    pass
-                with p8:
-                    pass
+                r1 = st.columns(4)
+                r1[0].number_input("Peso (kg)", value=float(pd.to_numeric(row0.get("Peso"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_peso")
+                r1[1].number_input("Altura (m)", value=float(pd.to_numeric(row0.get("Altura"), errors="coerce") or 0.0), min_value=0.0, step=0.01, key="edit_altura")
+                r1[2].number_input("Idade", value=int(pd.to_numeric(row0.get("Idade"), errors="coerce") or 0), min_value=0, step=1, key="edit_idade")
+                r1[3].text_input("Observações", value=str(row0.get("Observacoes", "") or ""), key="edit_obs")
 
                 st.markdown("**Dobras cutâneas (mm)**")
-                d1, d2, d3, d4, d5 = st.columns(5)
-                with d1:
-                    d_pe = st.number_input("D PE (peitoral)", value=0.0, step=0.1) if "D PE" in avaliacao.columns else None
-                with d2:
-                    d_ab = st.number_input("D AB (abdominal)", value=0.0, step=0.1) if "D AB" in avaliacao.columns else None
-                with d3:
-                    d_cx = st.number_input("D CX (coxa)", value=0.0, step=0.1) if "D CX" in avaliacao.columns else None
-                with d4:
-                    d_si = st.number_input("D SI (supra-ilíaca)", value=0.0, step=0.1) if "D SI" in avaliacao.columns else None
-                with d5:
-                    d_tr = st.number_input("D TR (tríceps)", value=0.0, step=0.1) if "D TR" in avaliacao.columns else None
+                d1 = st.columns(5)
+                d1[0].number_input("D PE", value=float(pd.to_numeric(row0.get("D PE"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_dpe")
+                d1[1].number_input("D AB", value=float(pd.to_numeric(row0.get("D AB"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_dab")
+                d1[2].number_input("D CX", value=float(pd.to_numeric(row0.get("D CX"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_dcx")
+                d1[3].number_input("D SI", value=float(pd.to_numeric(row0.get("D SI"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_dsi")
+                d1[4].number_input("D TR", value=float(pd.to_numeric(row0.get("D TR"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_dtr")
 
-                # Prévia dos cálculos (opcional)
-                sexo_calc = sexo_val if sexo_col else None
-                idade_f = _to_float_or_none(idade, treat_zero_as_none=True)
-                peso_f = _to_float_or_none(peso, treat_zero_as_none=True)
-                altura_f = _to_float_or_none(altura, treat_zero_as_none=True)
-                cc_f = _to_float_or_none(cc, treat_zero_as_none=True)
-                cq_f = _to_float_or_none(cq, treat_zero_as_none=True)
+                st.markdown("**Circunferências (cm)**")
+                ccs = st.columns(3)
+                ccs[0].number_input("CC", value=float(pd.to_numeric(row0.get("CC"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_cc")
+                ccs[1].number_input("CQ", value=float(pd.to_numeric(row0.get("CQ"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_cq")
+                ccs[2].number_input("CA", value=float(pd.to_numeric(row0.get("CA"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_ca")
 
-                d_pe_f = _to_float_or_none(d_pe, treat_zero_as_none=True)
-                d_ab_f = _to_float_or_none(d_ab, treat_zero_as_none=True)
-                d_cx_f = _to_float_or_none(d_cx, treat_zero_as_none=True)
-                d_si_f = _to_float_or_none(d_si, treat_zero_as_none=True)
-                d_tr_f = _to_float_or_none(d_tr, treat_zero_as_none=True)
+                ok = st.form_submit_button("Salvar alterações")
 
-                imc_calc = _calc_imc(peso_f, altura_f)
-                cls_imc = _classificacao_imc(imc_calc)
-                dc_calc = _calc_dc_jp3(sexo_calc, idade_f, d_pe_f, d_ab_f, d_cx_f, d_si_f, d_tr_f)
-                g_calc = _calc_gordura_siri(dc_calc)
-                mm_calc = (100 - g_calc) if g_calc is not None else None
-                rcq_calc = _calc_rcq(cc_f, cq_f)
-                risco_calc = _classificacao_rcq(sexo_calc, rcq_calc)
+            if ok:
+                updated = {c: row0.get(c) for c in base_cols}
+                updated["Nome"] = st.session_state["edit_nome"].strip()
+                updated["Data"] = st.session_state["edit_data"]
+                updated["Sexo"] = st.session_state["edit_sexo"]
 
-                prev1, prev2, prev3, prev4, prev5 = st.columns(5)
-                prev1.metric("IMC", f"{imc_calc:.2f}" if imc_calc is not None else "-")
-                prev2.metric("Classificação", cls_imc or "-")
-                prev3.metric("DC", f"{dc_calc:.6f}" if dc_calc is not None else "-")
-                prev4.metric("% Gordura", f"{g_calc:.2f} %" if g_calc is not None else "-")
-                prev5.metric("% Massa magra", f"{mm_calc:.2f} %" if mm_calc is not None else "-")
+                updated["Peso"] = _to_float_or_none(st.session_state["edit_peso"], treat_zero_as_none=True)
+                updated["Altura"] = _to_float_or_none(st.session_state["edit_altura"], treat_zero_as_none=True)
+                updated["Idade"] = _to_float_or_none(st.session_state["edit_idade"], treat_zero_as_none=True)
 
-                st.caption("Obs.: DC e %G são calculados pelo protocolo Jackson & Pollock (3 dobras) + Siri, igual ao padrão usado na sua planilha.")
+                updated["D PE"] = _to_float_or_none(st.session_state["edit_dpe"], treat_zero_as_none=True)
+                updated["D AB"] = _to_float_or_none(st.session_state["edit_dab"], treat_zero_as_none=True)
+                updated["D CX"] = _to_float_or_none(st.session_state["edit_dcx"], treat_zero_as_none=True)
+                updated["D SI"] = _to_float_or_none(st.session_state["edit_dsi"], treat_zero_as_none=True)
+                updated["D TR"] = _to_float_or_none(st.session_state["edit_dtr"], treat_zero_as_none=True)
 
-                submitted = st.form_submit_button("Salvar avaliação")
+                updated["CC"] = _to_float_or_none(st.session_state["edit_cc"], treat_zero_as_none=True)
+                updated["CQ"] = _to_float_or_none(st.session_state["edit_cq"], treat_zero_as_none=True)
+                updated["CA"] = _to_float_or_none(st.session_state["edit_ca"], treat_zero_as_none=True)
 
-            if submitted:
-                if not str(nome_novo).strip():
-                    st.error("Informe o Nome.")
-                elif sexo_col and not (sexo_val or "") .strip():
-                    st.error("Selecione o Sexo para calcular DC, % gordura, % massa magra e risco do RCQ.")
-                else:
-                    # Monta linha com as mesmas colunas da planilha
-                    row = {c: None for c in avaliacao.columns}
-                    row["Nome"] = str(nome_novo).strip()
-                    row["Data"] = data_nova
-                    if sexo_col:
-                        row[sexo_col] = sexo_val if sexo_val else None
+                if "Observacoes" in base_cols:
+                    updated["Observacoes"] = st.session_state["edit_obs"]
 
-                    # salva entradas brutas (seguindo as colunas existentes)
-                    if "Idade" in avaliacao.columns:
-                        row["Idade"] = idade_f
-                    if "Peso" in avaliacao.columns:
-                        row["Peso"] = peso_f
-                    if "Altura" in avaliacao.columns:
-                        row["Altura"] = altura_f
-                    for c, v in [("CC", cc_f), ("CQ", cq_f), ("CA", _to_float_or_none(ca, treat_zero_as_none=True))]:
-                        if c in avaliacao.columns:
-                            row[c] = v
+                updated = _recompute_derived(updated, base_cols)
+                updated["ID"] = sel_id
 
-                    # Dobras
-                    for c, v in [("D PE", d_pe_f), ("D AB", d_ab_f), ("D CX", d_cx_f), ("D SI", d_si_f), ("D TR", d_tr_f)]:
-                        if c in avaliacao.columns:
-                            row[c] = v
+                db = avaliacao_db.copy()
+                db.loc[db["ID"].astype(str) == sel_id, base_cols] = pd.DataFrame([updated])[base_cols].values
+                _save_avaliacoes_db(db)
+                st.success("Avaliação atualizada.")
+                st.rerun()
 
-                    # Cálculos (igual planilha)
-                    if "IMC" in avaliacao.columns:
-                        row["IMC"] = imc_calc
-                    if "Classificação" in avaliacao.columns:
-                        row["Classificação"] = cls_imc
-                    if "DC" in avaliacao.columns:
-                        row["DC"] = dc_calc
-                    if "G" in avaliacao.columns:
-                        row["G"] = g_calc
-                    if "MM" in avaliacao.columns:
-                        row["MM"] = mm_calc
+    st.divider()
 
-                    if "RCQ" in avaliacao.columns:
-                        row["RCQ"] = rcq_calc
-                    if "RISCO" in avaliacao.columns:
-                        row["RISCO"] = risco_calc
+    # --------- Comparar duas avaliações ---------
+    with st.expander("Comparar avaliações"):
+        if av.shape[0] < 2:
+            st.info("Precisa de pelo menos 2 avaliações no filtro atual.")
+        else:
+            labels = av["Data"].astype(str) + " | " + av["ID"].astype(str)
+            map_label_id = dict(zip(labels, av["ID"].astype(str)))
+            l1 = st.selectbox("Avaliação A", list(map_label_id.keys()), index=0)
+            l2 = st.selectbox("Avaliação B", list(map_label_id.keys()), index=min(1, len(map_label_id)-1))
+            id_a, id_b = map_label_id[l1], map_label_id[l2]
 
-                    _append_avaliacao(row)
-                    st.success("Avaliação salva! Ela será combinada com sua planilha durante o uso do app.")
-                    st.rerun()
+            a = avaliacao_db[avaliacao_db["ID"].astype(str) == str(id_a)].iloc[0]
+            b = avaliacao_db[avaliacao_db["ID"].astype(str) == str(id_b)].iloc[0]
 
-    if av.empty:
-        st.info("Nenhum dado encontrado em AVALIACAO_FISICA para os filtros atuais.")
-    else:
-        # Mostra uma tabela limpa (remove colunas muito técnicas se existirem)
-        cols_preferidas = [
-            c for c in [
-                "Data",
-                "Nome",
-                "Peso",
-                "G",
-                "MM",
-                "IMC",
-                "CC",
-                "CQ",
-                "CA",
-                "RCQ",
-                "RISCO",
-            ]
-            if c in av.columns
-        ]
-        df_av = av[cols_preferidas] if cols_preferidas else av
-        st.dataframe(df_av, use_container_width=True, hide_index=True)
+            def getnum(s):
+                return pd.to_numeric(s, errors="coerce")
 
-        cexp1, cexp2 = st.columns([1, 3])
-        with cexp1:
-            # Export Excel
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                df_av.to_excel(writer, index=False, sheet_name="avaliacao")
-            st.download_button(
-                "Baixar avaliação (Excel)",
-                data=out.getvalue(),
-                file_name="avaliacao_fisica_filtrada.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        with cexp2:
-            st.caption("A tabela respeita os filtros de Nome e Período da barra lateral.")
+            campos = ["Peso", "G", "MM", "IMC", "CC", "CQ", "CA", "RCQ"]
+            rows = []
+            for c in campos:
+                if c in avaliacao_db.columns:
+                    va = float(getnum(a.get(c))) if pd.notna(getnum(a.get(c))) else None
+                    vb = float(getnum(b.get(c))) if pd.notna(getnum(b.get(c))) else None
+                    delta = (vb - va) if (va is not None and vb is not None) else None
+                    rows.append({"Métrica": c, "A": va, "B": vb, "Diferença (B-A)": delta})
 
+            df_cmp = pd.DataFrame(rows)
+            st.dataframe(df_cmp, use_container_width=True, hide_index=True)
 
-# ===================
-# Tab 2: Ficha de treino
-# ===================
-with tab2:
+# -----------------
+# Ficha de treino
+# -----------------
+with tab_ficha:
     st.subheader("Ficha de treino")
 
-    # Build group->exercise list from DADOS_TREINOS
-    grupos = []
-    ex_por_grupo = {}
-    if not dados_treinos.empty:
-        grupos = [c for c in dados_treinos.columns if str(c).strip()]
-        for g in grupos:
-            exs = dados_treinos[g].dropna().astype(str)
-            exs = [e.strip() for e in exs.tolist() if e.strip() and e.strip().lower() != "nan"]
-            ex_por_grupo[g] = exs
+    if dados_treinos.empty:
+        st.info("A aba DADOS_TREINOS não foi encontrada ou está vazia.")
+    else:
+        # tentando inferir colunas
+        cols = [c.lower() for c in dados_treinos.columns]
+        grp_col = None
+        ex_col = None
+        for c in dados_treinos.columns:
+            if str(c).lower() in {"grupo", "grupo muscular", "grupo_muscular"}:
+                grp_col = c
+            if str(c).lower() in {"exercicio", "exercício", "exercicio(s)", "exercícios"}:
+                ex_col = c
+        if grp_col is None:
+            grp_col = dados_treinos.columns[0]
+        if ex_col is None:
+            ex_col = dados_treinos.columns[1] if len(dados_treinos.columns) > 1 else dados_treinos.columns[0]
 
-    if not grupos:
-        st.warning("A aba DADOS_TREINOS nao foi encontrada (ou esta vazia). Sem ela, nao da para montar as listas de exercicios.")
+        grupos = sorted([x for x in dados_treinos[grp_col].dropna().astype(str).unique().tolist() if x.strip()])
 
-    if "ficha_itens" not in st.session_state:
-        st.session_state.ficha_itens = []  # list of dicts
+        if "ficha" not in st.session_state:
+            st.session_state["ficha"] = []
 
-    colA, colB, colC, colD = st.columns([1.2, 1.6, 1, 1])
+        c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.2, 2, 0.8, 0.8, 0.8])
+        with c1:
+            data_treino = st.date_input("Data", value=date.today())
+        with c2:
+            nome_treino = st.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
+        with c3:
+            grupo_sel = st.selectbox("Grupo muscular", grupos)
+        exs = sorted(
+            [
+                x
+                for x in dados_treinos.loc[dados_treinos[grp_col].astype(str) == str(grupo_sel), ex_col]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+                if x.strip()
+            ]
+        )
+        with c4:
+            exercicio_sel = st.selectbox("Exercício", exs if exs else ["(sem exercícios)"])
+        with c5:
+            series = st.number_input("Séries", min_value=1, step=1, value=3)
+        with c6:
+            reps = st.number_input("Reps", min_value=1, step=1, value=10)
 
-    with colA:
-        data_treino = st.date_input("Data do treino", value=date.today())
-        nome_treino = st.text_input("Nome", value=nome_sel if nome_sel and nome_sel != "(sem nomes)" else "")
-
-    with colB:
-        grupo_sel = st.selectbox("Grupo muscular", grupos if grupos else ["-"])
-        exercicios = ex_por_grupo.get(grupo_sel, [])
-        exerc_sel = st.selectbox("Exercicio", exercicios if exercicios else ["-"])
-
-    with colC:
-        series = st.number_input("Séries", min_value=1, max_value=20, value=3, step=1)
-        reps = st.number_input("Repetições", min_value=1, max_value=100, value=10, step=1)
-
-    with colD:
-        carga = st.number_input("Carga (kg)", min_value=0.0, max_value=500.0, value=0.0, step=0.5)
+        carga = st.number_input("Carga (kg)", min_value=0.0, step=0.5, value=0.0)
         obs = st.text_input("Observações", value="")
 
-    b1, b2, b3 = st.columns([1, 1, 2])
-    with b1:
-        if st.button("Adicionar na ficha", use_container_width=True, type="primary"):
-            if grupo_sel == "-" or exerc_sel == "-":
-                st.warning("Selecione grupo e exercicio.")
-            else:
-                st.session_state.ficha_itens.append({
+        add = st.button("Adicionar na ficha")
+        if add:
+            st.session_state["ficha"].append(
+                {
                     "Data": data_treino,
                     "Nome": nome_treino,
                     "Grupo muscular": grupo_sel,
-                    "Exercicio": exerc_sel,
-                    "Series": int(series),
-                    "Repeticoes": int(reps),
-                    "Carga (kg)": float(carga),
-                    "Observacoes": obs.strip() if obs else "",
-                })
-
-    with b2:
-        if st.button("Limpar ficha", use_container_width=True):
-            st.session_state.ficha_itens = []
-
-    with b3:
-        if st.button("Salvar como treino realizado", use_container_width=True):
-            if not st.session_state.ficha_itens:
-                st.warning("A ficha esta vazia.")
-            else:
-                _append_registro(st.session_state.ficha_itens)
-                st.success("Treino registrado!")
-                st.session_state.ficha_itens = []
-
-    st.markdown("#### Itens na ficha")
-    df_ficha = pd.DataFrame(st.session_state.ficha_itens)
-    st.dataframe(df_ficha, use_container_width=True, hide_index=True)
-
-    # Exportar ficha
-    if not df_ficha.empty:
-        ex1, ex2, ex3 = st.columns([1.2, 1.2, 2])
-        with ex1:
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                df_ficha.to_excel(writer, index=False, sheet_name="ficha")
-            st.download_button(
-                "Exportar ficha (Excel)",
-                data=out.getvalue(),
-                file_name="ficha_treino.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Exercicio": exercicio_sel,
+                    "Series": series,
+                    "Repeticoes": reps,
+                    "Carga (kg)": carga,
+                    "Observacoes": obs,
+                }
             )
-        with ex2:
-            pdf_bytes = _make_pdf_from_table("Ficha de treino", df_ficha)
-            st.download_button(
-                "Exportar ficha (PDF)",
-                data=pdf_bytes,
-                file_name="ficha_treino.pdf",
-                mime="application/pdf",
-            )
-        with ex3:
-            st.caption("Exporta somente os itens atualmente listados na ficha.")
 
+        df_ficha = pd.DataFrame(st.session_state["ficha"]) if st.session_state["ficha"] else pd.DataFrame()
 
-# =====================
-# Tab 3: Registro de treinos
-# =====================
-with tab3:
+        st.divider()
+        st.markdown("#### Ficha (itens adicionados)")
+        if df_ficha.empty:
+            st.info("Adicione exercícios para montar a ficha.")
+        else:
+            st.dataframe(df_ficha, use_container_width=True, hide_index=True)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Salvar no registro"):
+                    rows = df_ficha.to_dict(orient="records")
+                    _append_registro(rows)
+                    st.success("Treino salvo no registro.")
+            with c2:
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                    df_ficha.to_excel(writer, index=False, sheet_name="FICHA")
+                st.download_button(
+                    "Exportar ficha (Excel)",
+                    data=out.getvalue(),
+                    file_name="ficha_treino.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with c3:
+                pdf_bytes = _make_pdf_from_table("Ficha de Treino", df_ficha)
+                st.download_button(
+                    "Exportar ficha (PDF)",
+                    data=pdf_bytes,
+                    file_name="ficha_treino.pdf",
+                    mime="application/pdf",
+                )
+
+            if st.button("Limpar ficha"):
+                st.session_state["ficha"] = []
+                st.rerun()
+
+# -----------------
+# Registro de treinos
+# -----------------
+with tab_reg:
     st.subheader("Registro de treinos")
 
-    df_reg = _read_registro()
+    reg = _read_registro()
+    if reg.empty:
+        st.info("Nenhum treino registrado ainda.")
 
-    # Filters
-    f1, f2, f3 = st.columns([1.2, 1.2, 2])
-    with f1:
-        nome_f = st.text_input("Filtrar por nome", value="")
-    with f2:
-        grupo_f = st.text_input("Filtrar por grupo muscular", value="")
-    with f3:
-        st.caption("Dica: o registro fica salvo em 'registro_treinos.csv' no servidor do app.")
+    # filtro por nome
+    if "Nome" in reg.columns and nomes:
+        reg_f = reg[reg["Nome"].astype(str) == str(nome_sel)].copy()
+    else:
+        reg_f = reg.copy()
 
-    df_show = df_reg.copy()
-    if nome_f.strip():
-        df_show = df_show[df_show["Nome"].astype(str).str.contains(nome_f.strip(), case=False, na=False)]
-    if grupo_f.strip():
-        df_show = df_show[df_show["Grupo muscular"].astype(str).str.contains(grupo_f.strip(), case=False, na=False)]
+    reg_f = reg_f.sort_values("Data")
 
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
+    st.markdown("#### Editar / excluir")
+    st.caption("Selecione uma ou mais linhas para excluir. Para editar, selecione exatamente 1 linha.")
 
-    # Download
-    csv_bytes = df_show.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Baixar registro filtrado (CSV)",
-        data=csv_bytes,
-        file_name="registro_treinos_filtrado.csv",
-        mime="text/csv",
+    view = reg_f.copy()
+    if "Selecionar" not in view.columns:
+        view.insert(0, "Selecionar", False)
+
+    edited = st.data_editor(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Selecionar": st.column_config.CheckboxColumn("Selecionar", help="Marque para editar/excluir"),
+        },
+        disabled=[c for c in view.columns if c != "Selecionar"],
+        key="reg_editor",
     )
 
-    if st.button("Apagar registro do servidor", type="secondary"):
-        if os.path.exists(REGISTRO_PATH):
-            os.remove(REGISTRO_PATH)
-            st.success("Registro apagado.")
-        else:
-            st.info("Nao existe registro salvo ainda.")
+    selected_ids = []
+    if "Selecionar" in edited.columns and "ID" in edited.columns:
+        selected_ids = edited.loc[edited["Selecionar"] == True, "ID"].astype(str).tolist()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Excluir selecionados", disabled=(len(selected_ids) == 0)):
+            st.session_state["confirm_del_treinos"] = True
+
+    with c2:
+        if st.button("Editar selecionado", disabled=(len(selected_ids) != 1)):
+            st.session_state["edit_treino_id"] = selected_ids[0]
+
+    with c3:
+        # downloads filtrados
+        st.download_button(
+            "Baixar registro filtrado (CSV)",
+            data=reg_f.drop(columns=[c for c in ["Selecionar"] if c in reg_f.columns]).to_csv(index=False).encode("utf-8"),
+            file_name="registro_treinos_filtrado.csv",
+            mime="text/csv",
+        )
+
+    # Confirmacao exclusao
+    if st.session_state.get("confirm_del_treinos", False):
+        st.warning(f"Tem certeza que deseja excluir {len(selected_ids)} registro(s)?")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("Confirmar exclusao"):
+                reg_new = reg[~reg["ID"].astype(str).isin([str(i) for i in selected_ids])].copy()
+                _save_registro(reg_new)
+                st.session_state["confirm_del_treinos"] = False
+                st.success("Registros excluidos.")
+                st.rerun()
+        with cc2:
+            if st.button("Cancelar"):
+                st.session_state["confirm_del_treinos"] = False
+
+    # Edicao (1 linha)
+    edit_id = st.session_state.get("edit_treino_id", None)
+    if edit_id:
+        row = reg.loc[reg["ID"].astype(str) == str(edit_id)].iloc[0].to_dict()
+        with st.expander("Editar treino selecionado", expanded=True):
+            with st.form("form_edit_treino"):
+                d = st.date_input("Data", value=row.get("Data") or date.today())
+                nome = st.text_input("Nome", value=str(row.get("Nome", "")))
+                grupo = st.text_input("Grupo muscular", value=str(row.get("Grupo muscular", "")))
+                ex = st.text_input("Exercicio", value=str(row.get("Exercicio", "")))
+                s = st.number_input("Series", min_value=0.0, value=float(row.get("Series") or 0.0), step=1.0)
+                r = st.number_input("Repeticoes", min_value=0.0, value=float(row.get("Repeticoes") or 0.0), step=1.0)
+                kg = st.number_input("Carga (kg)", min_value=0.0, value=float(row.get("Carga (kg)") or 0.0), step=0.5)
+                obs = st.text_input("Observacoes", value=str(row.get("Observacoes", "")))
+                ok = st.form_submit_button("Salvar alteracoes")
+
+            if ok:
+                reg_new = reg.copy()
+                mask = reg_new["ID"].astype(str) == str(edit_id)
+                reg_new.loc[mask, "Data"] = d
+                reg_new.loc[mask, "Nome"] = nome
+                reg_new.loc[mask, "Grupo muscular"] = grupo
+                reg_new.loc[mask, "Exercicio"] = ex
+                reg_new.loc[mask, "Series"] = s
+                reg_new.loc[mask, "Repeticoes"] = r
+                reg_new.loc[mask, "Carga (kg)"] = kg
+                reg_new.loc[mask, "Observacoes"] = obs
+                _save_registro(reg_new)
+                st.session_state["edit_treino_id"] = None
+                st.success("Treino atualizado.")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### Visualizacao")
+    st.dataframe(reg_f.drop(columns=[c for c in ["Selecionar"] if c in reg_f.columns]), use_container_width=True, hide_index=True)
+
+    # downloads completos
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Baixar registro (CSV)", data=reg.to_csv(index=False).encode("utf-8"), file_name="registro_treinos.csv", mime="text/csv")
+    with c2:
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            reg.to_excel(writer, index=False, sheet_name="REGISTRO")
+        st.download_button(
+            "Baixar registro (Excel)",
+            data=out.getvalue(),
+            file_name="registro_treinos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
