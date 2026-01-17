@@ -444,9 +444,16 @@ def _find_template_sheet(wb):
 
 def _fill_ficha_sheet(ws, nome: str, d: date, itens: pd.DataFrame, obs: str = ""):
     """Preenche uma aba no modelo FICHA_TREINO preservando formatação."""
-    # Cabeçalho (células mescladas: escreva no canto superior esquerdo do merge)
-    ws["B1"].value = f"Nome: {nome}"
-    ws["D1"].value = f"Data: {d.strftime('%d/%m/%Y')}"
+    # Cabeçalho (no seu modelo: B1="Nome:", C1=Nome; D1="Data:", E1=Data)
+    # Se escrevermos "Nome: <nome>" em B1, o valor antigo de C1 pode ficar e o texto aparece duplicado.
+    # Portanto, preservamos os rótulos e preenchemos apenas os campos de valor.
+    ws["B1"].value = "Nome:"
+    ws["C1"].value = str(nome)
+    ws["D1"].value = "Data:"
+    # Mantém como data (não texto) para o Excel formatar e para fórmulas funcionarem
+    ws["E1"].value = datetime(d.year, d.month, d.day)
+
+    # Linha do dia da semana (B2:F2 é mesclado no modelo)
     ws["B2"].value = _pt_weekday(d)
 
     # Limpar linhas da tabela no modelo
@@ -530,12 +537,12 @@ def _export_ficha_excel_model(
             dfw["Data"] = pd.to_datetime(dfw["Data"], errors="coerce").dt.date
             dfw = dfw[(dfw["Data"] >= start) & (dfw["Data"] <= end)]
 
-        # cria uma aba por dia que tenha treino
+        # cria uma aba por dia da semana (segunda a domingo).
+        # Mesmo que não haja itens no dia, a aba é criada (modelo preenchido com cabeçalho),
+        # para facilitar impressão/organização semanal.
         for i in range(7):
             d = start + timedelta(days=i)
             itens_d = dfw[dfw.get("Data") == d] if (not dfw.empty and "Data" in dfw.columns) else pd.DataFrame()
-            if itens_d is None or itens_d.empty:
-                continue
             ws = _copy_with_title(_pt_weekday(d))
             _fill_ficha_sheet(ws, nome, d, itens_d, obs="")
 
