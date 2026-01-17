@@ -3,6 +3,8 @@ import os
 import zipfile
 from datetime import date, timedelta
 
+from openpyxl import load_workbook
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -28,6 +30,12 @@ AVALIACOES_DB_PATH = "avaliacoes_db.csv" # base editável (inicializa a partir d
 DATABASE_URL = (os.getenv("DATABASE_URL") or (st.secrets.get("DATABASE_URL", None) if hasattr(st, "secrets") else None))
 
 BACKUP_ZIP_NAME = "backup_app_personal.zip"
+
+# Excel template (aba de ficha)
+TEMPLATE_SHEET_NAME = "FICHA_TREINO"  # conforme seu arquivo
+FICHA_TABLE_START_ROW = 4  # primeira linha com exercícios
+FICHA_MAX_ROWS = 9         # quantidade de linhas disponíveis no modelo (4..12)
+FICHA_OBS_CELL = "B15"     # início do campo de observações (mesclado)
 
 # -------------------------------------------------
 # Helpers
@@ -403,6 +411,143 @@ def _make_pdf_from_table(title: str, df: pd.DataFrame) -> bytes:
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+def _pt_weekday(d: date) -> str:
+    # Monday=0
+    nomes = [
+        "SEGUNDA-FEIRA",
+        "TERÇA-FEIRA",
+        "QUARTA-FEIRA",
+        "QUINTA-FEIRA",
+        "SEXTA-FEIRA",
+        "SÁBADO",
+        "DOMINGO",
+    ]
+    try:
+        return nomes[d.weekday()]
+    except Exception:
+        return "TREINO"
+
+
+def _find_template_sheet(wb):
+    if TEMPLATE_SHEET_NAME in wb.sheetnames:
+        return wb[TEMPLATE_SHEET_NAME]
+    # fallback: primeira aba que contenha FICHA e TREINO no nome
+    for s in wb.sheetnames:
+        s_norm = str(s).upper().replace(" ", "_")
+        if "FICHA" in s_norm and "TREINO" in s_norm:
+            return wb[s]
+    # fallback: primeira aba
+    return wb[wb.sheetnames[0]]
+
+
+def _fill_ficha_sheet(ws, nome: str, d: date, itens: pd.DataFrame, obs: str = ""):
+    """Preenche uma aba no modelo FICHA_TREINO preservando formatação."""
+    # Cabeçalho (células mescladas: escreva no canto superior esquerdo do merge)
+    ws["B1"].value = f"Nome: {nome}"
+    ws["D1"].value = f"Data: {d.strftime('%d/%m/%Y')}"
+    ws["B2"].value = _pt_weekday(d)
+
+    # Limpar linhas da tabela no modelo
+    start = FICHA_TABLE_START_ROW
+    for i in range(FICHA_MAX_ROWS):
+        r = start + i
+        for c in ["B", "C", "D", "E", "F"]:
+            ws[f"{c}{r}"].value = None
+
+    # Preencher tabela (limitar ao espaço disponível)
+    if itens is None or itens.empty:
+        pass
+    else:
+        cols_map = {
+            "grupo": next((c for c in itens.columns if "grupo" in str(c).lower()), None),
+            "ex": next((c for c in itens.columns if "exerc" in str(c).lower()), None),
+            "series": next((c for c in itens.columns if "serie" in str(c).lower()), None),
+            "reps": next((c for c in itens.columns if "rep" in str(c).lower()), None),
+            "carga": next((c for c in itens.columns if "carga" in str(c).lower()), None),
+        }
+        for idx, row in itens.reset_index(drop=True).iterrows():
+            if idx >= FICHA_MAX_ROWS:
+                break
+            r = start + idx
+            ws[f"B{r}"].value = str(row.get(cols_map["grupo"], "")) if cols_map["grupo"] else ""
+            ws[f"C{r}"].value = str(row.get(cols_map["ex"], "")) if cols_map["ex"] else ""
+            ws[f"D{r}"].value = row.get(cols_map["series"], "") if cols_map["series"] else ""
+            ws[f"E{r}"].value = row.get(cols_map["reps"], "") if cols_map["reps"] else ""
+            ws[f"F{r}"].value = row.get(cols_map["carga"], "") if cols_map["carga"] else ""
+
+    # Observações
+    if obs:
+        ws[FICHA_OBS_CELL].value = obs
+
+
+def _export_ficha_excel_model(
+    xlsx_bytes: bytes | None,
+    nome: str,
+    modo: str,
+    data_base: date,
+    df_dia: pd.DataFrame,
+    df_semana: pd.DataFrame,
+    obs: str = "",
+) -> bytes:
+    """Gera Excel usando o layout existente do arquivo (aba FICHA_TREINO).
+
+    modo: "Dia" ou "Semana"
+    df_dia: itens do dia
+    df_semana: itens da semana inteira (com coluna Data)
+    """
+    # Carregar workbook (do upload ou do arquivo padrão)
+    if xlsx_bytes:
+        buf = io.BytesIO(xlsx_bytes)
+        wb = load_workbook(buf)
+    else:
+        wb = load_workbook(DEFAULT_XLSX_PATH)
+
+    template = _find_template_sheet(wb)
+
+    def _copy_with_title(title: str):
+        ws_new = wb.copy_worksheet(template)
+        # título único
+        base = title[:31]
+        if base in wb.sheetnames:
+            k = 2
+            while f"{base}_{k}" in wb.sheetnames:
+                k += 1
+            base = f"{base}_{k}"[:31]
+        ws_new.title = base
+        return ws_new
+
+    if str(modo).lower().startswith("dia"):
+        ws = _copy_with_title(_pt_weekday(data_base))
+        _fill_ficha_sheet(ws, nome, data_base, df_dia, obs=obs)
+    else:
+        # Semana (segunda a domingo) da data_base
+        start = data_base - timedelta(days=data_base.weekday())
+        end = start + timedelta(days=6)
+        dfw = df_semana.copy() if df_semana is not None else pd.DataFrame()
+        if not dfw.empty and "Data" in dfw.columns:
+            dfw["Data"] = pd.to_datetime(dfw["Data"], errors="coerce").dt.date
+            dfw = dfw[(dfw["Data"] >= start) & (dfw["Data"] <= end)]
+
+        # cria uma aba por dia que tenha treino
+        for i in range(7):
+            d = start + timedelta(days=i)
+            itens_d = dfw[dfw.get("Data") == d] if (not dfw.empty and "Data" in dfw.columns) else pd.DataFrame()
+            if itens_d is None or itens_d.empty:
+                continue
+            ws = _copy_with_title(_pt_weekday(d))
+            _fill_ficha_sheet(ws, nome, d, itens_d, obs="")
+
+    # Remover template original para não ir no arquivo final
+    try:
+        wb.remove(template)
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 def _make_pdf_report(nome: str, periodo: tuple, kpis: dict, rcq_table: pd.DataFrame) -> bytes:
     """PDF simples: KPIs + RCQ/Risco (texto)."""
@@ -1302,26 +1447,64 @@ with tab_ficha:
         else:
             st.dataframe(df_ficha, use_container_width=True, hide_index=True)
 
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3 = st.columns([1.2, 2, 1.2])
             with c1:
                 if st.button("Salvar no registro"):
                     rows = df_ficha.to_dict(orient="records")
                     _append_registro(rows)
                     st.success("Treino salvo no registro.")
+
             with c2:
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                    df_ficha.to_excel(writer, index=False, sheet_name="FICHA")
+                modo_exp = st.radio(
+                    "Exportação",
+                    ["Treino do dia (modelo do Excel)", "Treinos da semana (modelo do Excel)"],
+                    horizontal=True,
+                )
+
+                # dados para exportação
+                df_dia = df_ficha.copy()
+                if "Data" in df_dia.columns:
+                    df_dia["Data"] = pd.to_datetime(df_dia["Data"], errors="coerce").dt.date
+                    df_dia = df_dia[df_dia["Data"] == data_treino]
+
+                # Semana: usa registro + ficha atual (caso não tenha salvado ainda)
+                reg_all = _read_registro()
+                if not reg_all.empty:
+                    if "Data" in reg_all.columns:
+                        reg_all["Data"] = pd.to_datetime(reg_all["Data"], errors="coerce").dt.date
+                    if "Nome" in reg_all.columns:
+                        reg_all = reg_all[reg_all["Nome"].astype(str) == str(nome_treino)]
+                df_semana = pd.concat([reg_all, df_ficha], ignore_index=True) if not reg_all.empty else df_ficha.copy()
+
+                xlsx_bytes = uploaded.getvalue() if uploaded else None
+                modo_simple = "Dia" if modo_exp.startswith("Treino do dia") else "Semana"
+                excel_model = _export_ficha_excel_model(
+                    xlsx_bytes=xlsx_bytes,
+                    nome=str(nome_treino),
+                    modo=modo_simple,
+                    data_base=data_treino,
+                    df_dia=df_dia,
+                    df_semana=df_semana,
+                    obs=str(obs or ""),
+                )
+
+                fname = (
+                    f"ficha_{str(nome_treino).replace(' ', '_')}_{data_treino.strftime('%Y-%m-%d')}.xlsx"
+                    if modo_simple == "Dia"
+                    else f"ficha_semana_{str(nome_treino).replace(' ', '_')}_{data_treino.strftime('%Y-%m-%d')}.xlsx"
+                )
+
                 st.download_button(
-                    "Exportar ficha (Excel)",
-                    data=out.getvalue(),
-                    file_name="ficha_treino.xlsx",
+                    "Baixar ficha (Excel - modelo)",
+                    data=excel_model,
+                    file_name=fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
             with c3:
                 pdf_bytes = _make_pdf_from_table("Ficha de Treino", df_ficha)
                 st.download_button(
-                    "Exportar ficha (PDF)",
+                    "Exportar ficha (PDF simples)",
                     data=pdf_bytes,
                     file_name="ficha_treino.pdf",
                     mime="application/pdf",
