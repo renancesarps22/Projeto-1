@@ -340,11 +340,12 @@ def _recompute_derived(row: dict, base_cols: list[str]) -> dict:
     imc = _calc_imc(peso, altura)
     out["IMC"] = imc
     imc_cls = _classificacao_imc(imc)
-    # Algumas planilhas usam "Classificação" em vez de "Classificação IMC".
+    # Sempre gravar a classificação (algumas planilhas usam "Classificação",
+    # outras "Classificação IMC"). Se a coluna não existir no Excel original,
+    # ainda assim exibimos no app.
+    out["Classificação"] = imc_cls
     if "Classificação IMC" in base_cols:
         out["Classificação IMC"] = imc_cls
-    if "Classificação" in base_cols:
-        out["Classificação"] = imc_cls
 
     dc = _calc_dc_jp3(sexo, idade, d_pe, d_ab, d_cx, d_si, d_tr)
     if "DC" in base_cols:
@@ -1118,7 +1119,9 @@ with tab_ficha:
     if dados_treinos.empty:
         st.info("A aba DADOS_TREINOS não foi encontrada ou está vazia.")
     else:
-        # tentando inferir colunas (robusto a espaços/acentos)
+        # A planilha pode vir em dois formatos:
+        # (A) "longo": colunas [Grupo, Exercicio]
+        # (B) "wide" (seu caso): cada COLUNA eh um grupo muscular, e as CELULAS sao os exercicios.
         import unicodedata
 
         def _norm_col(x: object) -> str:
@@ -1133,36 +1136,109 @@ with tab_ficha:
             nc = _norm_col(c)
             if nc in {"grupo", "grupo muscular", "grupomuscular"}:
                 grp_col = c
-            if nc in {"exercicio", "exercicios", "exercicio(s)", "exercicio(s)", "exercicios"}:
+            if nc in {"exercicio", "exercicios", "exercicio(s)", "exercicio(s)"}:
                 ex_col = c
 
-        # fallback: se não identificar pelo nome, usa heurística por cardinalidade
-        if (grp_col is None or ex_col is None) and len(dados_treinos.columns) >= 2:
-            c0, c1 = dados_treinos.columns[0], dados_treinos.columns[1]
-            u0 = dados_treinos[c0].dropna().astype(str).str.strip()
-            u1 = dados_treinos[c1].dropna().astype(str).str.strip()
-            n0 = u0.nunique()
-            n1 = u1.nunique()
-            # coluna com menos únicos tende a ser o grupo
-            if grp_col is None and ex_col is None:
-                if n0 <= n1:
-                    grp_col, ex_col = c0, c1
-                else:
-                    grp_col, ex_col = c1, c0
-            elif grp_col is None:
-                grp_col = c0 if ex_col == c1 else c1
-            elif ex_col is None:
-                ex_col = c0 if grp_col == c1 else c1
+        is_long_format = grp_col is not None and ex_col is not None
 
-        if grp_col is None:
-            grp_col = dados_treinos.columns[0]
-        if ex_col is None:
-            ex_col = dados_treinos.columns[1] if len(dados_treinos.columns) > 1 else dados_treinos.columns[0]
-
-        grupos = sorted([x for x in dados_treinos[grp_col].dropna().astype(str).unique().tolist() if x.strip()])
+        if is_long_format:
+            grupos = sorted([x for x in dados_treinos[grp_col].dropna().astype(str).unique().tolist() if str(x).strip()])
+        else:
+            # formato wide: os grupos sao os nomes das colunas com pelo menos 1 valor
+            grupos = [c for c in dados_treinos.columns if dados_treinos[c].notna().any()]
+            grupos = sorted([str(g).strip() for g in grupos if str(g).strip()])
 
         if "ficha" not in st.session_state:
             st.session_state["ficha"] = []
+
+        # -----------------
+        # Planos prontos (simples)
+        # -----------------
+        with st.expander("Gerar treino pronto (modelos)"):
+            st.caption("Gera uma ficha automaticamente com base nos grupos disponíveis na planilha de treinos.")
+
+            modelos = {
+                "ABC (Hipertrofia)": {
+                    "A": ["PEITO", "TRICEPS", "ABDÔMEN"],
+                    "B": ["COSTAS", "BÍCEPS"],
+                    "C": ["PERNAS", "GLÚTEOS", "PANTURRILHAS"],
+                },
+                "Full Body": {
+                    "Único": ["PEITO", "COSTAS", "OMBROS", "PERNAS", "ABDÔMEN"],
+                },
+                "PPL": {
+                    "Push": ["PEITO", "OMBROS", "TRICEPS"],
+                    "Pull": ["COSTAS", "BÍCEPS"],
+                    "Legs": ["PERNAS", "GLÚTEOS", "PANTURRILHAS"],
+                },
+            }
+
+            modelo = st.selectbox("Modelo", list(modelos.keys()))
+            dia = st.selectbox("Dia", list(modelos[modelo].keys()))
+            n_ex_por_grupo = st.slider("Exercícios por grupo", 1, 6, 3)
+            series_padrao = st.number_input("Séries padrão", 1, 10, 3)
+            reps_padrao = st.number_input("Reps padrão", 1, 30, 10)
+
+            def _get_exs_for_group(group_name: str) -> list[str]:
+                # tenta casar ignorando acentos/caixa
+                def _norm(s: str) -> str:
+                    ss = str(s).strip().lower().replace("_", " ")
+                    ss = "".join(ch for ch in unicodedata.normalize("NFKD", ss) if not unicodedata.combining(ch))
+                    ss = " ".join(ss.split())
+                    return ss
+
+                target = _norm(group_name)
+
+                if is_long_format:
+                    # encontra o grupo mais parecido
+                    poss = dados_treinos[grp_col].dropna().astype(str).unique().tolist()
+                    match = None
+                    for g in poss:
+                        if _norm(g) == target:
+                            match = g
+                            break
+                    if match is None:
+                        return []
+                    exs0 = (
+                        dados_treinos.loc[dados_treinos[grp_col].astype(str) == str(match), ex_col]
+                        .dropna()
+                        .astype(str)
+                        .map(lambda x: x.strip())
+                        .tolist()
+                    )
+                    return [x for x in exs0 if x]
+
+                # wide: colunas = grupos
+                cols = list(dados_treinos.columns)
+                match_col = None
+                for c in cols:
+                    if _norm(c) == target:
+                        match_col = c
+                        break
+                if match_col is None:
+                    return []
+                exs0 = dados_treinos[match_col].dropna().astype(str).map(lambda x: x.strip()).tolist()
+                return [x for x in exs0 if x]
+
+            if st.button("Gerar ficha agora"):
+                st.session_state["ficha"] = []
+                for g in modelos[modelo][dia]:
+                    exs_g = _get_exs_for_group(g)
+                    for ex in exs_g[:n_ex_por_grupo]:
+                        st.session_state["ficha"].append(
+                            {
+                                "Data": date.today(),
+                                "Nome": nome_sel if "nome_sel" in locals() else "(sem nomes)",
+                                "Grupo muscular": g,
+                                "Exercicio": ex,
+                                "Series": int(series_padrao),
+                                "Repeticoes": int(reps_padrao),
+                                "Carga (kg)": 0.0,
+                                "Observacoes": "",
+                            }
+                        )
+                st.success("Ficha gerada. Ajuste cargas/observações e salve no registro.")
+                st.rerun()
 
         c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.2, 2, 0.8, 0.8, 0.8])
         with c1:
@@ -1171,17 +1247,27 @@ with tab_ficha:
             nome_treino = st.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
         with c3:
             grupo_sel = st.selectbox("Grupo muscular", grupos)
-        exs = sorted(
-            [
-                x
-                for x in dados_treinos.loc[dados_treinos[grp_col].astype(str) == str(grupo_sel), ex_col]
+        if is_long_format:
+            exs = (
+                dados_treinos.loc[dados_treinos[grp_col].astype(str) == str(grupo_sel), ex_col]
                 .dropna()
                 .astype(str)
+                .map(lambda x: x.strip())
                 .unique()
                 .tolist()
-                if x.strip()
-            ]
-        )
+            )
+        else:
+            # wide: pega os valores nao nulos da coluna selecionada
+            col = str(grupo_sel)
+            exs = (
+                dados_treinos[col]
+                .dropna()
+                .astype(str)
+                .map(lambda x: x.strip())
+                .unique()
+                .tolist()
+            )
+        exs = sorted([x for x in exs if x])
         with c4:
             exercicio_sel = st.selectbox("Exercício", exs if exs else ["(sem exercícios)"])
         with c5:
@@ -1353,6 +1439,53 @@ with tab_reg:
     st.divider()
     st.markdown("#### Visualizacao")
     st.dataframe(reg_f.drop(columns=[c for c in ["Selecionar"] if c in reg_f.columns]), use_container_width=True, hide_index=True)
+
+    # -----------------
+    # Evolucao de carga / PR
+    # -----------------
+    st.divider()
+    st.markdown("#### Evolução de carga por exercício")
+
+    if not reg_f.empty and ("Exercicio" in reg_f.columns) and ("Data" in reg_f.columns):
+        ex_opts = sorted(reg_f["Exercicio"].dropna().astype(str).unique().tolist())
+        ex_pick = st.selectbox("Exercício", ex_opts)
+
+        evo = reg_f[reg_f["Exercicio"].astype(str) == str(ex_pick)].copy()
+        evo["Data"] = pd.to_datetime(evo["Data"], errors="coerce")
+        evo = evo.dropna(subset=["Data"]).sort_values("Data")
+
+        # Carga
+        if "Carga (kg)" in evo.columns:
+            evo["Carga (kg)"] = pd.to_numeric(evo["Carga (kg)"], errors="coerce")
+        if "Series" in evo.columns:
+            evo["Series"] = pd.to_numeric(evo["Series"], errors="coerce")
+        if "Repeticoes" in evo.columns:
+            evo["Repeticoes"] = pd.to_numeric(evo["Repeticoes"], errors="coerce")
+
+        # PR
+        pr = None
+        if "Carga (kg)" in evo.columns and evo["Carga (kg)"].notna().any():
+            pr = float(evo["Carga (kg)"].max())
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("PR (carga máxima)", f"{pr:.2f} kg" if pr is not None else "—")
+        with c2:
+            # volume = series * reps * carga
+            vol = None
+            if all(col in evo.columns for col in ["Series", "Repeticoes", "Carga (kg)"]):
+                evo["Volume"] = evo["Series"].fillna(0) * evo["Repeticoes"].fillna(0) * evo["Carga (kg)"].fillna(0)
+                vol = float(evo["Volume"].sum()) if evo["Volume"].notna().any() else None
+            st.metric("Volume no período", f"{vol:.0f}" if vol is not None else "—")
+
+        if not evo.empty and "Carga (kg)" in evo.columns:
+            fig = px.line(evo, x="Data", y="Carga (kg)", markers=True, title=f"Carga ao longo do tempo - {ex_pick}", template=PLOTLY_TEMPLATE)
+            st.plotly_chart(fig, use_container_width=True)
+
+        if not evo.empty and "Volume" in evo.columns:
+            fig2 = px.bar(evo, x="Data", y="Volume", title=f"Volume por sessão - {ex_pick}", template=PLOTLY_TEMPLATE)
+            st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("Registre treinos para ver a evolução por exercício.")
 
     # downloads completos
     c1, c2 = st.columns(2)
