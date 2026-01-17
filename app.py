@@ -779,6 +779,30 @@ with tab_dash:
 
         if not nome_report:
             nome_report = 'avaliacao'
+        # Garantir datas para o relatório (evita NameError em data_i/data_f)
+        from datetime import date as _date
+        
+        # Se o app já tiver definido data_i/data_f em outro ponto, respeite.
+        # Caso contrário, inferimos do dataframe filtrado (av) ou usamos hoje.
+        if ('data_i' not in locals()) or (data_i is None):
+            try:
+                if 'av' in locals() and isinstance(av, pd.DataFrame) and (not av.empty) and ('Data' in av.columns):
+                    _min = pd.to_datetime(av['Data'], errors='coerce').dropna().min()
+                    data_i = _min.date() if hasattr(_min, 'date') else _min
+                else:
+                    data_i = _date.today()
+            except Exception:
+                data_i = _date.today()
+        
+        if ('data_f' not in locals()) or (data_f is None):
+            try:
+                if 'av' in locals() and isinstance(av, pd.DataFrame) and (not av.empty) and ('Data' in av.columns):
+                    _max = pd.to_datetime(av['Data'], errors='coerce').dropna().max()
+                    data_f = _max.date() if hasattr(_max, 'date') else _max
+                else:
+                    data_f = _date.today()
+            except Exception:
+                data_f = _date.today()
         pdf_rel = _make_pdf_report(nome_report, (data_i, data_f), kpis_report, rcq_tbl)
         st.download_button('Exportar relatorio (PDF)', data=pdf_rel, file_name=f'relatorio_{nome_report}.pdf', mime='application/pdf')
 
@@ -1313,4 +1337,3 @@ with tab_reg:
             file_name="registro_treinos.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
