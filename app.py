@@ -339,8 +339,12 @@ def _recompute_derived(row: dict, base_cols: list[str]) -> dict:
 
     imc = _calc_imc(peso, altura)
     out["IMC"] = imc
+    imc_cls = _classificacao_imc(imc)
+    # Algumas planilhas usam "Classificação" em vez de "Classificação IMC".
     if "Classificação IMC" in base_cols:
-        out["Classificação IMC"] = _classificacao_imc(imc)
+        out["Classificação IMC"] = imc_cls
+    if "Classificação" in base_cols:
+        out["Classificação"] = imc_cls
 
     dc = _calc_dc_jp3(sexo, idade, d_pe, d_ab, d_cx, d_si, d_tr)
     if "DC" in base_cols:
@@ -1114,15 +1118,42 @@ with tab_ficha:
     if dados_treinos.empty:
         st.info("A aba DADOS_TREINOS não foi encontrada ou está vazia.")
     else:
-        # tentando inferir colunas
-        cols = [c.lower() for c in dados_treinos.columns]
+        # tentando inferir colunas (robusto a espaços/acentos)
+        import unicodedata
+
+        def _norm_col(x: object) -> str:
+            s = str(x).strip().lower().replace("_", " ")
+            s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+            s = " ".join(s.split())
+            return s
+
         grp_col = None
         ex_col = None
         for c in dados_treinos.columns:
-            if str(c).lower() in {"grupo", "grupo muscular", "grupo_muscular"}:
+            nc = _norm_col(c)
+            if nc in {"grupo", "grupo muscular", "grupomuscular"}:
                 grp_col = c
-            if str(c).lower() in {"exercicio", "exercício", "exercicio(s)", "exercícios"}:
+            if nc in {"exercicio", "exercicios", "exercicio(s)", "exercicio(s)", "exercicios"}:
                 ex_col = c
+
+        # fallback: se não identificar pelo nome, usa heurística por cardinalidade
+        if (grp_col is None or ex_col is None) and len(dados_treinos.columns) >= 2:
+            c0, c1 = dados_treinos.columns[0], dados_treinos.columns[1]
+            u0 = dados_treinos[c0].dropna().astype(str).str.strip()
+            u1 = dados_treinos[c1].dropna().astype(str).str.strip()
+            n0 = u0.nunique()
+            n1 = u1.nunique()
+            # coluna com menos únicos tende a ser o grupo
+            if grp_col is None and ex_col is None:
+                if n0 <= n1:
+                    grp_col, ex_col = c0, c1
+                else:
+                    grp_col, ex_col = c1, c0
+            elif grp_col is None:
+                grp_col = c0 if ex_col == c1 else c1
+            elif ex_col is None:
+                ex_col = c0 if grp_col == c1 else c1
+
         if grp_col is None:
             grp_col = dados_treinos.columns[0]
         if ex_col is None:
