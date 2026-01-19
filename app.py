@@ -1127,87 +1127,79 @@ if page == "Avaliação Física":
 
     # --------- Adicionar nova avaliação ---------
     with st.expander("Adicionar nova avaliação"):
-    if IS_STUDENT:
-        st.info("Modo aluno: apenas visualização.")
-    else:
-        base_cols = avaliacao_db.columns.tolist()
+        if IS_STUDENT:
+            st.info("Modo aluno: apenas visualização.")
+        else:
+            base_cols = avaliacao_db.columns.tolist()
 
-        with st.form("form_nova_avaliacao", border=True):
-            c1, c2, c3 = st.columns([2, 1, 1])
-            with c1:
-                nome_novo = st.text_input("Nome", value=nome_sel if nome_sel != "(sem nomes)" else "")
-            with c2:
-                data_nova = st.date_input("Data", value=date.today())
-            with c3:
-                sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0)
+            with st.form("form_nova_avaliacao", border=True):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    nome_novo = st.text_input("Nome", value=nome_sel if nome_sel != "(sem nomes)" else "")
+                with c2:
+                    data_nova = st.date_input("Data", value=date.today())
+                with c3:
+                    sexo_novo = st.selectbox("Sexo", ["M", "F"], index=0)
 
-            # inputs principais
-            r1 = st.columns(4)
-            peso = r1[0].number_input("Peso (kg)", min_value=0.0, step=0.1, value=0.0)
-            altura = r1[1].number_input("Altura (m)", min_value=0.0, step=0.01, value=0.0)
-            idade = r1[2].number_input("Idade", min_value=0, step=1, value=0)
-            obs = r1[3].text_input("Observações", value="") if "Observacoes" in base_cols else ""
+                # Inputs numéricos principais (adapte conforme suas colunas)
+                col_a, col_b, col_c, col_d = st.columns(4)
+                with col_a:
+                    peso_novo = st.number_input("Peso (kg)", min_value=0.0, step=0.1, value=0.0)
+                with col_b:
+                    altura_novo = st.number_input("Altura (m)", min_value=0.0, step=0.01, value=0.0)
+                with col_c:
+                    idade_nova = st.number_input("Idade", min_value=0, step=1, value=0)
+                with col_d:
+                    ca_nova = st.number_input("CA", min_value=0.0, step=0.1, value=0.0)
 
-            st.markdown("**Dobras cutâneas (mm)**")
-            d1 = st.columns(5)
-            d_pe = d1[0].number_input("D PE (peitoral)", min_value=0.0, step=0.1, value=0.0)
-            d_ab = d1[1].number_input("D AB (abdominal)", min_value=0.0, step=0.1, value=0.0)
-            d_cx = d1[2].number_input("D CX (coxa)", min_value=0.0, step=0.1, value=0.0)
-            d_si = d1[3].number_input("D SI (supra-ilíaca)", min_value=0.0, step=0.1, value=0.0)
-            d_tr = d1[4].number_input("D TR (tríceps)", min_value=0.0, step=0.1, value=0.0)
+                # Dobras e circunferências (se existirem nas colunas)
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    d_pe = st.number_input("D PE", min_value=0.0, step=0.1, value=0.0)
+                    d_tr = st.number_input("D TR", min_value=0.0, step=0.1, value=0.0)
+                with d2:
+                    d_ab = st.number_input("D AB", min_value=0.0, step=0.1, value=0.0)
+                    d_si = st.number_input("D SI", min_value=0.0, step=0.1, value=0.0)
+                with d3:
+                    d_cx = st.number_input("D CX", min_value=0.0, step=0.1, value=0.0)
+                    cc_nova = st.number_input("CC", min_value=0.0, step=0.1, value=0.0)
+                    cq_nova = st.number_input("CQ", min_value=0.0, step=0.1, value=0.0)
 
-            st.markdown("**Circunferências (cm)**")
-            ccs = st.columns(4)
-            cc = ccs[0].number_input("CC (cintura)", min_value=0.0, step=0.1, value=0.0)
-            cq = ccs[1].number_input("CQ (quadril)", min_value=0.0, step=0.1, value=0.0)
-            ca = ccs[2].number_input("CA (abdômen)", min_value=0.0, step=0.1, value=0.0)
-            # RCQ calculado, mas deixo visível
-            rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
+                obs_nova = st.text_area("Observações", value="")
+                ok_add = st.form_submit_button("Adicionar avaliação")
 
-            submitted = st.form_submit_button("Salvar avaliação", disabled=IS_STUDENT)
+            if ok_add:
+                # Monta linha respeitando colunas existentes
+                new = {c: None for c in base_cols}
+                if "Nome" in new: new["Nome"] = nome_novo
+                if "Data" in new: new["Data"] = data_nova
+                if "Sexo" in new: new["Sexo"] = sexo_novo
+                if "Idade" in new: new["Idade"] = int(idade_nova)
+                if "Peso" in new: new["Peso"] = float(peso_novo)
+                if "Altura" in new: new["Altura"] = float(altura_novo)
+                if "CA" in new: new["CA"] = float(ca_nova)
+                if "CC" in new: new["CC"] = float(cc_nova)
+                if "CQ" in new: new["CQ"] = float(cq_nova)
+                if "D PE" in new: new["D PE"] = float(d_pe)
+                if "D AB" in new: new["D AB"] = float(d_ab)
+                if "D CX" in new: new["D CX"] = float(d_cx)
+                if "D SI" in new: new["D SI"] = float(d_si)
+                if "D TR" in new: new["D TR"] = float(d_tr)
+                if "Obs" in new: new["Obs"] = obs_nova
 
-        if submitted:
-            if not nome_novo.strip():
-                st.error("Preencha o Nome.")
-            elif sexo_val not in {"Homem", "Mulher"}:
-                st.error("Selecione o Sexo.")
-            else:
-                row = {c: None for c in base_cols}
-                row["Nome"] = nome_novo.strip()
-                row["Data"] = data_nova
-                row["Sexo"] = sexo_val
+                new_row = pd.DataFrame([new])
+                new_row = _ensure_id(_to_date_col(new_row, "Data"))
 
-                row["Peso"] = _to_float_or_none(peso, treat_zero_as_none=True)
-                row["Altura"] = _to_float_or_none(altura, treat_zero_as_none=True)
-                row["Idade"] = _to_float_or_none(idade, treat_zero_as_none=True)
+                # Recalcula campos derivados se as funções existirem
+                try:
+                    new_row = _calc_derived(new_row)  # noqa: F821
+                except Exception:
+                    pass
 
-                row["D PE"] = _to_float_or_none(d_pe, treat_zero_as_none=True)
-                row["D AB"] = _to_float_or_none(d_ab, treat_zero_as_none=True)
-                row["D CX"] = _to_float_or_none(d_cx, treat_zero_as_none=True)
-                row["D SI"] = _to_float_or_none(d_si, treat_zero_as_none=True)
-                row["D TR"] = _to_float_or_none(d_tr, treat_zero_as_none=True)
-
-                row["CC"] = _to_float_or_none(cc, treat_zero_as_none=True)
-                row["CQ"] = _to_float_or_none(cq, treat_zero_as_none=True)
-                row["CA"] = _to_float_or_none(ca, treat_zero_as_none=True)
-
-                if "Observacoes" in base_cols:
-                    row["Observacoes"] = obs
-
-                row = _recompute_derived(row, base_cols)
-
-                # ID
-                row["ID"] = str(abs(hash(f"{row['Nome']}|{row['Data']}|{os.urandom(6).hex()}")))
-
-                db = avaliacao_db.copy()
-                db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-                db = _ensure_id(db)
-                _save_avaliacoes_db(db)
-
-                st.success("Avaliação salva.")
+                avaliacao_db = pd.concat([avaliacao_db, new_row], ignore_index=True)
+                _save_avaliacoes_db(avaliacao_db)
+                st.success("Avaliação adicionada.")
                 st.rerun()
-
-    st.divider()
 
     # --------- Editar avaliação ---------
     with st.expander("Editar avaliação"):
