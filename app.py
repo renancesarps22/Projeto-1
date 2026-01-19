@@ -1129,7 +1129,7 @@ if page == "Avaliação Física":
     with st.expander("Adicionar nova avaliação"):
     if IS_STUDENT:
         st.info("Modo aluno: apenas visualização.")
-
+    else:
         base_cols = avaliacao_db.columns.tolist()
 
         with st.form("form_nova_avaliacao", border=True):
