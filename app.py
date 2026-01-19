@@ -758,11 +758,63 @@ st.markdown(THEMES_CSS.get(tema, ""), unsafe_allow_html=True)
 modo_mobile = st.sidebar.toggle("Modo celular (layout compacto)", value=st.session_state.get("modo_mobile", False))
 st.session_state["modo_mobile"] = modo_mobile
 
+# Modo aluno (somente leitura)
+# - Configure FORCE_ALUNO=true em Secrets/Env para forçar modo aluno
+force_aluno = False
+
+# Link de aluno (somente leitura): adicione ?aluno=1 ao final da URL do app
+# Ex.: https://seu-app.streamlit.app/?aluno=1
+def _get_query_param(name: str):
+    """Compat: st.query_params (novo) ou st.experimental_get_query_params (antigo)."""
+    try:
+        qp = st.query_params  # Streamlit >= 1.30
+        val = qp.get(name)
+        if isinstance(val, list):
+            return val[0] if val else None
+        return val
+    except Exception:
+        try:
+            qp = st.experimental_get_query_params()
+            val = qp.get(name)
+            return val[0] if isinstance(val, list) and val else None
+        except Exception:
+            return None
+
+def _truthy(v) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s in {"1", "true", "t", "yes", "y", "sim", "on"}
+
+# Se o link tiver ?aluno=1, forçamos modo aluno para esta sessão (sem precisar mexer no sidebar)
+force_aluno_link = _truthy(_get_query_param("aluno"))
+try:
+    force_aluno = bool(st.secrets.get("FORCE_ALUNO", False))
+except Exception:
+    force_aluno = False
+if os.getenv("FORCE_ALUNO") in {"1", "true", "True", "YES", "yes"}:
+    force_aluno = True
+
+# Aplicar força via link (secrets/env ainda têm prioridade, mas o link ativa quando não há secrets)
+if force_aluno_link:
+    force_aluno = True
+
+if force_aluno:
+    IS_STUDENT = True
+else:
+    IS_STUDENT = st.sidebar.toggle(
+        "Modo aluno (somente leitura)",
+        value=st.session_state.get("IS_STUDENT", False),
+        help="Quando ligado, esconde adicionar/editar/excluir. Para forçar, use FORCE_ALUNO em Secrets.",
+    )
+    st.session_state["IS_STUDENT"] = IS_STUDENT
+
+
 with st.sidebar.expander("Backup e exportacao"):
     st.caption("Baixe um backup das bases (avaliacoes + treinos) ja com edicoes/exclusoes.")
     try:
         _bk = _make_backup_zip(avaliacao_db if "avaliacao_db" in locals() else pd.DataFrame(), _read_registro())
-        st.download_button("Baixar backup (ZIP)", data=_bk, file_name=BACKUP_ZIP_NAME, mime="application/zip")
+        st.download_button("Baixar backup (ZIP)", data=_bk, file_name=BACKUP_ZIP_NAME, mime="application/zip", disabled=IS_STUDENT)
     except Exception as _e:
         st.info("Backup ficara disponivel apos carregar os dados.")
 
@@ -773,11 +825,14 @@ with st.sidebar.expander("Banco de dados (opcional)"):
         st.warning("Sem banco configurado: usando arquivos CSV locais")
     st.caption("Se quiser usar Supabase/Neon/Postgres, configure DATABASE_URL em Settings > Secrets no Streamlit Cloud.")
 
-uploaded = st.sidebar.file_uploader(
-    "Envie o Excel (APP PERSONAL.xlsx)",
-    type=["xlsx"],
-    help="Se você não enviar, o app tenta carregar o arquivo padrão (APP PERSONAL.xlsx).",
-)
+if IS_STUDENT:
+    uploaded = None
+else:
+    uploaded = st.sidebar.file_uploader(
+        "Envie o Excel (APP PERSONAL.xlsx)",
+        type=["xlsx"],
+        help="Se você não enviar, o app tenta carregar o arquivo padrão (APP PERSONAL.xlsx).",
+    )
 
 try:
     sheets = _load_workbook(uploaded.getvalue() if uploaded else None)
@@ -797,7 +852,7 @@ avaliacao_db = _load_or_init_avaliacoes_db(avaliacao_xlsx)
 
 # Se o usuário subir um Excel diferente e quiser reiniciar a base
 with st.sidebar.expander("Configurações avançadas"):
-    if st.button("Reinicializar avaliações com o Excel enviado"):
+    if (not IS_STUDENT) and st.button("Reinicializar avaliações com o Excel enviado"):
         base = _ensure_id(_to_date_col(avaliacao_xlsx.copy(), "Data"))
         _save_avaliacoes_db(base)
         st.success("Base de avaliações reinicializada.")
@@ -854,17 +909,12 @@ av = av.sort_values("Data")
 # Tabs
 # -------------------------------------------------
 
-tab_dash, tab_av, tab_ficha, tab_reg = st.tabs([
-    "Dashboard",
-    "Avaliação Física",
-    "Ficha de treino",
-    "Registro de treinos",
-])
+page = st.radio("Menu", ["Dashboard", "Avaliação Física", "Ficha de treino", "Registro de treinos"], horizontal=not modo_mobile)
 
 # -----------------
 # Dashboard
 # -----------------
-with tab_dash:
+if page == "Dashboard":
     st.subheader("Dashboard")
 
     if av.empty:
@@ -1016,7 +1066,7 @@ with tab_dash:
 # -----------------
 # Avaliação Física
 # -----------------
-with tab_av:
+if page == "Avaliação Física":
     st.subheader("Avaliação Física")
 
     # tabela (respeita filtros)
@@ -1037,7 +1087,7 @@ with tab_av:
 
         b1, b2, b3 = st.columns([1, 1, 2])
         with b1:
-            if st.button("Excluir selecionadas", disabled=len(selected_ids) == 0):
+            if st.button("Excluir selecionadas", disabled=(IS_STUDENT or len(selected_ids) == 0)):
                 st.session_state["confirm_delete"] = True
         with b2:
             if st.button("Exportar base atual (Excel)"):
@@ -1077,6 +1127,9 @@ with tab_av:
 
     # --------- Adicionar nova avaliação ---------
     with st.expander("Adicionar nova avaliação"):
+    if IS_STUDENT:
+        st.info("Modo aluno: apenas visualização.")
+
         base_cols = avaliacao_db.columns.tolist()
 
         with st.form("form_nova_avaliacao", border=True):
@@ -1111,7 +1164,7 @@ with tab_av:
             # RCQ calculado, mas deixo visível
             rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
 
-            submitted = st.form_submit_button("Salvar avaliação")
+            submitted = st.form_submit_button("Salvar avaliação", disabled=IS_STUDENT)
 
         if submitted:
             if not nome_novo.strip():
@@ -1197,7 +1250,7 @@ with tab_av:
                 ccs[1].number_input("CQ", value=float(pd.to_numeric(row0.get("CQ"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_cq")
                 ccs[2].number_input("CA", value=float(pd.to_numeric(row0.get("CA"), errors="coerce") or 0.0), min_value=0.0, step=0.1, key="edit_ca")
 
-                ok = st.form_submit_button("Salvar alterações")
+                ok = st.form_submit_button("Salvar alterações", disabled=IS_STUDENT)
 
             if ok:
                 updated = {c: row0.get(c) for c in base_cols}
@@ -1265,7 +1318,7 @@ with tab_av:
 # -----------------
 # Ficha de treino
 # -----------------
-with tab_ficha:
+if page == "Ficha de treino":
     st.subheader("Ficha de treino")
 
     if dados_treinos.empty:
@@ -1372,7 +1425,7 @@ with tab_ficha:
                 exs0 = dados_treinos[match_col].dropna().astype(str).map(lambda x: x.strip()).tolist()
                 return [x for x in exs0 if x]
 
-            if st.button("Gerar ficha agora"):
+            if st.button("Gerar ficha agora", disabled=IS_STUDENT):
                 st.session_state["ficha"] = []
                 for g in modelos[modelo][dia]:
                     exs_g = _get_exs_for_group(g)
@@ -1430,7 +1483,7 @@ with tab_ficha:
         carga = st.number_input("Carga (kg)", min_value=0.0, step=0.5, value=0.0)
         obs = st.text_input("Observações", value="")
 
-        add = st.button("Adicionar na ficha")
+        add = st.button("Adicionar na ficha", disabled=IS_STUDENT)
         if add:
             st.session_state["ficha"].append(
                 {
@@ -1456,7 +1509,7 @@ with tab_ficha:
 
             c1, c2, c3 = st.columns([1.2, 2, 1.2])
             with c1:
-                if st.button("Salvar no registro"):
+                if st.button("Salvar no registro", disabled=IS_STUDENT):
                     rows = df_ficha.to_dict(orient="records")
                     _append_registro(rows)
                     st.success("Treino salvo no registro.")
@@ -1524,7 +1577,7 @@ with tab_ficha:
 # -----------------
 # Registro de treinos
 # -----------------
-with tab_reg:
+if page == "Registro de treinos":
     st.subheader("Registro de treinos")
 
     reg = _read_registro()
@@ -1563,7 +1616,7 @@ with tab_reg:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Excluir selecionados", disabled=(len(selected_ids) == 0)):
+        if st.button("Excluir selecionados", disabled=(IS_STUDENT or (len(selected_ids) == 0))):
             st.session_state["confirm_del_treinos"] = True
 
     with c2:
@@ -1608,7 +1661,7 @@ with tab_reg:
                 r = st.number_input("Repeticoes", min_value=0.0, value=float(row.get("Repeticoes") or 0.0), step=1.0)
                 kg = st.number_input("Carga (kg)", min_value=0.0, value=float(row.get("Carga (kg)") or 0.0), step=0.5)
                 obs = st.text_input("Observacoes", value=str(row.get("Observacoes", "")))
-                ok = st.form_submit_button("Salvar alteracoes")
+                ok = st.form_submit_button("Salvar alteracoes", disabled=IS_STUDENT)
 
             if ok:
                 reg_new = reg.copy()
