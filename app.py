@@ -1075,8 +1075,9 @@ with tab_av:
 
     st.divider()
 
-    # --------- Adicionar nova avaliação ---------
-    with st.expander("Adicionar nova avaliação"):
+
+# --------- Adicionar nova avaliação ---------
+with st.expander("Adicionar nova avaliação"):
     if IS_STUDENT:
         st.info("Modo aluno: apenas visualização.")
     else:
@@ -1111,18 +1112,19 @@ with tab_av:
             cc = ccs[0].number_input("CC (cintura)", min_value=0.0, step=0.1, value=0.0)
             cq = ccs[1].number_input("CQ (quadril)", min_value=0.0, step=0.1, value=0.0)
             ca = ccs[2].number_input("CA (abdômen)", min_value=0.0, step=0.1, value=0.0)
-            _ = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
+            # RCQ calculado, mas deixo visível
+            rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
 
             submitted = st.form_submit_button("Salvar avaliação", disabled=IS_STUDENT)
 
         if submitted:
-            if not str(nome_novo or "").strip():
+            if not nome_novo.strip():
                 st.error("Preencha o Nome.")
             elif sexo_val not in {"Homem", "Mulher"}:
                 st.error("Selecione o Sexo.")
             else:
                 row = {c: None for c in base_cols}
-                row["Nome"] = str(nome_novo).strip()
+                row["Nome"] = nome_novo.strip()
                 row["Data"] = data_nova
                 row["Sexo"] = sexo_val
 
@@ -1155,7 +1157,6 @@ with tab_av:
 
                 st.success("Avaliação salva.")
                 st.rerun()
-
     st.divider()
 
     # --------- Editar avaliação ---------
