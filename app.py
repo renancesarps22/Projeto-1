@@ -1126,17 +1126,17 @@ if page == "Avaliação Física":
     st.divider()
 
     # --------- Adicionar nova avaliação ---------
-   with st.expander("Excluir avaliações selecionadas"):
-       if IS_STUDENT:
+    with st.expander("Excluir avaliações selecionadas"):
+        if IS_STUDENT:
            st.info("Modo aluno: apenas visualização.")
-       else:
+        else:
            confirmar = st.checkbox("Confirmar exclusão")
-           if confirmar:
-               if st.button("❌ Excluir selecionadas"):
-                   avaliacao_db = avaliacao_db[~avaliacao_db["ID"].isin(ids_sel)]
-                   _save_avaliacoes_db(avaliacao_db)
-                   st.success("Avaliações excluídas.")
-                   st.rerun()
+            if confirmar:
+                if st.button("❌ Excluir selecionadas"):
+                    avaliacao_db = avaliacao_db[~avaliacao_db["ID"].isin(ids_sel)]
+                    _save_avaliacoes_db(avaliacao_db)
+                    st.success("Avaliações excluídas.")
+                    st.rerun()
 
 
             # inputs principais
