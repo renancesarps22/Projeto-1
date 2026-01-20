@@ -7,12 +7,6 @@ from openpyxl import load_workbook
 
 import pandas as pd
 import streamlit as st
-
-# Supabase (Auth + Roles)
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
 import plotly.express as px
 
 # Optional DB (Supabase/Neon/Postgres)
@@ -790,164 +784,33 @@ def _truthy(v) -> bool:
     if v is None:
         return False
     s = str(v).strip().lower()
-    return s in {"1","true","t","yes","y","sim","on"}
+    return s in {"1", "true", "t", "yes", "y", "sim", "on"}
 
-# -----------------------------
-# Login Supabase + Perfis (aluno/professor)
-# -----------------------------
-def _get_secret(name: str, default=None):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-SUPABASE_URL = os.getenv("SUPABASE_URL") or _get_secret("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_ANON_KEY")
-PROFESSOR_SIGNUP_CODE = os.getenv("PROFESSOR_SIGNUP_CODE") or _get_secret("PROFESSOR_SIGNUP_CODE")
-
-def _supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_ANON_KEY and create_client is not None)
-
-@st.cache_resource
-def _sb_base():
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-def _get_session():
-    return st.session_state.get("sb_session")
-
-def _set_session(sess):
-    st.session_state["sb_session"] = sess
-
-def _sb_user():
-    sess = _get_session()
-    if not sess:
-        return None
-    try:
-        return sess.user
-    except Exception:
-        return None
-
-def _sb_role_and_nome():
-    """Lê role/nome do profiles; se não existir, cria como aluno."""
-    sb = _sb_base()
-    user = _sb_user()
-    if not user:
-        return ("", "")
-    uid = user.id
-    try:
-        resp = sb.table("profiles").select("role,nome").eq("user_id", uid).single().execute()
-        if resp and resp.data:
-            role = (resp.data.get("role") or "aluno")
-            nome = (resp.data.get("nome") or "")
-            return (role, nome)
-    except Exception:
-        pass
-
-    # cria perfil padrão aluno
-    try:
-        sb.table("profiles").upsert({"user_id": uid, "role": "aluno"}).execute()
-    except Exception:
-        pass
-    return ("aluno", "")
-
-def _sb_upsert_profile(nome: str, role: str):
-    sb = _sb_base()
-    user = _sb_user()
-    if not user:
-        return
-    sb.table("profiles").upsert({"user_id": user.id, "nome": nome, "role": role}).execute()
-
-# Se o link tiver ?aluno=1, forçamos modo aluno (visualização) nesta sessão
+# Se o link tiver ?aluno=1, forçamos modo aluno para esta sessão (sem precisar mexer no sidebar)
 force_aluno_link = _truthy(_get_query_param("aluno"))
+try:
+    force_aluno = bool(st.secrets.get("FORCE_ALUNO", False))
+except Exception:
+    force_aluno = False
+if os.getenv("FORCE_ALUNO") in {"1", "true", "True", "YES", "yes"}:
+    force_aluno = True
 
-ROLE = ""
-PROFILE_NOME = ""
-LOGADO = False
-
-if _supabase_enabled():
-    with st.sidebar.expander("Login"):
-        user = _sb_user()
-        if user:
-            LOGADO = True
-            ROLE, PROFILE_NOME = _sb_role_and_nome()
-            st.success(f"Logado: {user.email}")
-            st.caption(f"Perfil: {ROLE}")
-            if PROFILE_NOME:
-                st.caption(f"Nome: {PROFILE_NOME}")
-
-            if st.button("Sair"):
-                _set_session(None)
-                st.rerun()
-        else:
-            t1, t2 = st.tabs(["Entrar", "Cadastrar"])
-            with t1:
-                email = st.text_input("E-mail", key="login_email")
-                senha = st.text_input("Senha", type="password", key="login_senha")
-                if st.button("Entrar", use_container_width=True):
-                    sb = _sb_base()
-                    try:
-                        res = sb.auth.sign_in_with_password({"email": email, "password": senha})
-                        _set_session(res.session)
-                        st.rerun()
-                    except Exception:
-                        st.error("Falha no login. Confira e-mail e senha.")
-            with t2:
-                nome_cad = st.text_input("Nome (igual na planilha)", key="cad_nome")
-                email2 = st.text_input("E-mail", key="cad_email")
-                senha2 = st.text_input("Senha", type="password", key="cad_senha")
-                cod_prof = st.text_input("Código de professor (opcional)", type="password", key="cad_cod")
-                if st.button("Cadastrar", use_container_width=True):
-                    sb = _sb_base()
-                    try:
-                        res = sb.auth.sign_up({"email": email2, "password": senha2})
-                        # Dependendo do Supabase, pode exigir confirmação de e-mail.
-                        role = "professor" if (PROFESSOR_SIGNUP_CODE and cod_prof == PROFESSOR_SIGNUP_CODE) else "aluno"
-                        if res.session:
-                            _set_session(res.session)
-                            _sb_upsert_profile(nome_cad.strip(), role)
-                            st.success("Cadastro criado e logado!")
-                            st.rerun()
-                        else:
-                            st.success("Cadastro criado! Agora faça login (ou confirme o e-mail, se o Supabase exigir).")
-                    except Exception:
-                        st.error("Não foi possível cadastrar. Verifique se o e-mail já existe.")
-else:
-    st.sidebar.warning("Login não configurado. Defina SUPABASE_URL e SUPABASE_ANON_KEY em Secrets para usar cadastro/alunos.")
-
-# Se login estiver habilitado, exigimos login para acessar o app completo
-if _supabase_enabled() and not LOGADO:
-    st.title("App Personal")
-    st.info("Faça login na barra lateral para continuar.")
-    st.stop()
-
-IS_STUDENT = (ROLE == "aluno") if LOGADO else False
-IS_PROF = (ROLE == "professor") if LOGADO else False
-
-# Link ?aluno=1 força modo aluno (mesmo se for professor), útil para compartilhar
+# Aplicar força via link (secrets/env ainda têm prioridade, mas o link ativa quando não há secrets)
 if force_aluno_link:
-    IS_STUDENT = True
-    IS_PROF = False
+    force_aluno = True
 
-# UI: se não houver login habilitado, mantém o toggle antigo
-if not _supabase_enabled():
-    try:
-        force_aluno = bool(st.secrets.get("FORCE_ALUNO", False))
-    except Exception:
-        force_aluno = False
-    if os.getenv("FORCE_ALUNO") in {"1", "true", "True", "YES", "yes"}:
-        force_aluno = True
-    if force_aluno:
-        IS_STUDENT = True
-    else:
-        IS_STUDENT = st.sidebar.toggle(
-            "Modo aluno (somente leitura)",
-            value=st.session_state.get("IS_STUDENT", False),
-            help="Quando ligado, esconde adicionar/editar/excluir. Para forçar, use FORCE_ALUNO em Secrets.",
-        )
-        st.session_state["IS_STUDENT"] = IS_STUDENT
+if force_aluno:
+    IS_STUDENT = True
+else:
+    IS_STUDENT = st.sidebar.toggle(
+        "Modo aluno (somente leitura)",
+        value=st.session_state.get("IS_STUDENT", False),
+        help="Quando ligado, esconde adicionar/editar/excluir. Para forçar, use FORCE_ALUNO em Secrets.",
+    )
+    st.session_state["IS_STUDENT"] = IS_STUDENT
+
 
 with st.sidebar.expander("Backup e exportacao"):
-
     st.caption("Baixe um backup das bases (avaliacoes + treinos) ja com edicoes/exclusoes.")
     try:
         _bk = _make_backup_zip(avaliacao_db if "avaliacao_db" in locals() else pd.DataFrame(), _read_registro())
@@ -1000,11 +863,8 @@ avaliacao_db = _to_date_col(avaliacao_db, "Data")
 
 nomes = sorted([x for x in avaliacao_db.get("Nome", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x.strip()])
 
-if LOGADO and IS_STUDENT and PROFILE_NOME:
-    nome_sel = str(PROFILE_NOME)
-    st.sidebar.markdown(f"**Aluno:** {nome_sel}")
-else:
-    nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
+nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
+
 # Período rápido
 if avaliacao_db["Data"].notna().any():
     dmax = avaliacao_db["Data"].max()
