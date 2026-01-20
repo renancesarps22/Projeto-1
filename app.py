@@ -708,14 +708,48 @@ def _save_avaliacoes_db(df: pd.DataFrame):
 
 st.sidebar.title("App Personal")
 
-# Login opcional por senha (secrets / env). Se não definido, fica liberado.
+
+# Login e permissões (Aluno x Professor) - opcional via secrets/env
+# Secrets/env aceitos:
+# - TEACHER_PASSWORD (ou APP_PASSWORD como fallback)
+# - STUDENT_PASSWORD
 with st.sidebar.expander("Acesso (opcional)"):
-    senha_req = os.getenv("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", None) if hasattr(st, "secrets") else None
-    senha_in = st.text_input("Senha (se estiver configurada)", type="password")
-    if senha_req:
-        if senha_in != senha_req:
-            st.sidebar.warning("Senha necessária para usar o app.")
-    
+    teacher_pw = (os.getenv("TEACHER_PASSWORD")
+                  or (st.secrets.get("TEACHER_PASSWORD") if hasattr(st, "secrets") else None)
+                  or os.getenv("APP_PASSWORD")
+                  or (st.secrets.get("APP_PASSWORD") if hasattr(st, "secrets") else None))
+    student_pw = (os.getenv("STUDENT_PASSWORD")
+                  or (st.secrets.get("STUDENT_PASSWORD") if hasattr(st, "secrets") else None))
+
+    # Persistir escolha no session_state
+    default_role = st.session_state.get("role", "Professor" if (teacher_pw is None and student_pw is None) else "Visitante")
+    role = st.selectbox("Perfil", ["Visitante", "Aluno", "Professor"], index=["Visitante","Aluno","Professor"].index(default_role))
+    pw_in = st.text_input("Senha (se estiver configurada)", type="password")
+
+    auth_ok = True
+    if role == "Aluno":
+        if student_pw:
+            auth_ok = (pw_in == student_pw)
+        else:
+            # Sem senha configurada: continua somente visualização
+            auth_ok = True
+    elif role == "Professor":
+        if teacher_pw:
+            auth_ok = (pw_in == teacher_pw)
+        else:
+            # Sem senha configurada: libera como professor
+            auth_ok = True
+
+    if not auth_ok:
+        st.warning("Senha incorreta para este perfil.")
+        role = "Visitante"
+
+    st.session_state["role"] = role
+
+# Flags globais de permissão
+ROLE = st.session_state.get("role", "Visitante")
+IS_STUDENT = ROLE in ("Visitante", "Aluno")
+IS_TEACHER = ROLE == "Professor"
 # Tema
 tema = st.sidebar.selectbox(
     "Tema do dashboard",
@@ -1075,12 +1109,8 @@ with tab_av:
 
     st.divider()
 
-
-# --------- Adicionar nova avaliação ---------
-with st.expander("Adicionar nova avaliação"):
-    if IS_STUDENT:
-        st.info("Modo aluno: apenas visualização.")
-    else:
+    # --------- Adicionar nova avaliação ---------
+    with st.expander("Adicionar nova avaliação"):
         base_cols = avaliacao_db.columns.tolist()
 
         with st.form("form_nova_avaliacao", border=True):
@@ -1115,7 +1145,7 @@ with st.expander("Adicionar nova avaliação"):
             # RCQ calculado, mas deixo visível
             rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
 
-            submitted = st.form_submit_button("Salvar avaliação", disabled=IS_STUDENT)
+            submitted = st.form_submit_button("Salvar avaliação")
 
         if submitted:
             if not nome_novo.strip():
@@ -1157,6 +1187,7 @@ with st.expander("Adicionar nova avaliação"):
 
                 st.success("Avaliação salva.")
                 st.rerun()
+
     st.divider()
 
     # --------- Editar avaliação ---------
