@@ -1057,7 +1057,7 @@ with tab_av:
                 st.info('Modo aluno: não é permitido excluir avaliações.')
                 st.session_state['confirm_delete'] = False
             else:
-                if st.button('🗑️ Excluir selecionadas', disabled=(len(ids_sel) == 0)):
+                if st.button('🗑️ Excluir selecionadas', disabled=(len(selected_ids) == 0)):
                     st.session_state['confirm_delete'] = True
         with b2:
             if IS_STUDENT:
