@@ -20,6 +20,15 @@ except Exception:  # pragma: no cover
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
+
+# -----------------------
+# Controle simples de permissões (aluno x professor)
+# Se você já usa Supabase Auth, deixe st.session_state['sb_role']='student'/'teacher'.
+# Caso contrário, o app assume professor (mantém compatibilidade).
+ROLE = (st.session_state.get('sb_role') or st.session_state.get('role') or 'teacher')
+IS_STUDENT = (ROLE == 'student')
+IS_TEACHER = (ROLE == 'teacher')
+
 st.set_page_config(page_title="App Personal", layout="wide")
 
 DEFAULT_XLSX_PATH = "APP PERSONAL.xlsx"  # keep in same folder on deploy
@@ -708,170 +717,14 @@ def _save_avaliacoes_db(df: pd.DataFrame):
 
 st.sidebar.title("App Personal")
 
-
-# -------------------------------------------------
-# Acesso (Supabase Auth) - recomendado
-# - Professor: pode editar/inserir
-# - Aluno: somente visualização e exportação
-# Requer secrets:
-#   SUPABASE_URL, SUPABASE_ANON_KEY
-# Opcional (para professor criar alunos pelo app):
-#   SUPABASE_SERVICE_ROLE_KEY
-# -------------------------------------------------
-import httpx
-
-def _sb_get(name: str, default=None):
-    try:
-        if hasattr(st, "secrets") and name in st.secrets:
-            return st.secrets.get(name)
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-SUPABASE_URL = _sb_get("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = _sb_get("SUPABASE_ANON_KEY", "")
-SUPABASE_SERVICE_ROLE_KEY = _sb_get("SUPABASE_SERVICE_ROLE_KEY", "")
-PROFESSOR_SIGNUP_CODE = _sb_get("PROFESSOR_SIGNUP_CODE", "")
-
-def _sb_headers(token: str | None = None, service: bool = False):
-    key = SUPABASE_SERVICE_ROLE_KEY if service else SUPABASE_ANON_KEY
-    h = {"apikey": key}
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
-
-def _sb_auth_login(email: str, password: str):
-    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
-    r = httpx.post(url, headers=_sb_headers(), json={"email": email, "password": password}, timeout=20.0)
-    r.raise_for_status()
-    return r.json()
-
-def _sb_rest_get(path: str, token: str, params: dict | None = None):
-    url = f"{SUPABASE_URL}/rest/v1/{path}"
-    r = httpx.get(url, headers=_sb_headers(token=token), params=params or {}, timeout=20.0)
-    r.raise_for_status()
-    return r.json()
-
-def _sb_rest_post(path: str, token: str, payload: list[dict] | dict, service: bool = False):
-    url = f"{SUPABASE_URL}/rest/v1/{path}"
-    headers = _sb_headers(token=token if not service else None, service=service)
-    headers["Content-Type"] = "application/json"
-    headers["Prefer"] = "return=representation"
-    r = httpx.post(url, headers=headers, json=payload, timeout=20.0)
-    r.raise_for_status()
-    return r.json()
-
-def _sb_admin_create_user(email: str, password: str):
-    url = f"{SUPABASE_URL}/auth/v1/admin/users"
-    headers = _sb_headers(service=True)
-    headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
-    headers["Content-Type"] = "application/json"
-    r = httpx.post(url, headers=headers, json={"email": email, "password": password, "email_confirm": True}, timeout=20.0)
-    r.raise_for_status()
-    return r.json()
-
-def _sb_get_role(uid: str, token: str) -> str | None:
-    try:
-        rows = _sb_rest_get("profiles", token, params={"select":"role", "user_id": f"eq.{uid}"})
-        if rows:
-            return rows[0].get("role")
-    except Exception:
-        return None
-    return None
-
-def _sb_get_student_nome(uid: str, token: str) -> str | None:
-    try:
-        rows = _sb_rest_get("students", token, params={"select":"nome", "user_id": f"eq.{uid}"})
-        if rows:
-            return (rows[0].get("nome") or "").strip() or None
-    except Exception:
-        return None
-    return None
-
-# Estado padrão (para não quebrar o app)
-IS_STUDENT = False
-IS_TEACHER = True
-CURRENT_UID = None
-CURRENT_EMAIL = None
-STUDENT_NOME = None
-
-with st.sidebar.expander("Acesso (login por e-mail)"):
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        st.warning("Supabase não configurado (SUPABASE_URL / SUPABASE_ANON_KEY). O app fica sem login por e-mail.")
-    else:
-        if st.session_state.get("sb_token"):
-            token = st.session_state.get("sb_token")
-            CURRENT_UID = st.session_state.get("sb_uid")
-            CURRENT_EMAIL = st.session_state.get("sb_email")
-            role = st.session_state.get("sb_role", None)
-
-            st.success(f"Logado: {CURRENT_EMAIL} ({role or 'sem perfil'})")
-            if st.button("Sair"):
-                for k in ["sb_token","sb_refresh","sb_uid","sb_email","sb_role","sb_student_nome"]:
-                    st.session_state.pop(k, None)
-                st.rerun()
-
-            # Criar aluno (somente professor)
-            if role == "teacher":
-                st.markdown("**Criar aluno (somente professor)**")
-                if not SUPABASE_SERVICE_ROLE_KEY:
-                    st.info("Defina SUPABASE_SERVICE_ROLE_KEY nos Secrets para habilitar criação de alunos.")
-                else:
-                    with st.form("form_create_student"):
-                        aluno_email = st.text_input("E-mail do aluno")
-                        aluno_senha = st.text_input("Senha inicial", type="password")
-                        aluno_nome = st.text_input("Nome do aluno (como no Excel)")
-                        codigo = st.text_input("Código do professor", type="password")
-                        ok = st.form_submit_button("Criar aluno")
-                    if ok:
-                        if PROFESSOR_SIGNUP_CODE and codigo != PROFESSOR_SIGNUP_CODE:
-                            st.error("Código do professor inválido.")
-                        else:
-                            try:
-                                u = _sb_admin_create_user(aluno_email.strip(), aluno_senha)
-                                uid_new = u.get("id")
-                                # cria profile + student
-                                _sb_rest_post("profiles", token="", payload={"user_id": uid_new, "role": "student"}, service=True)
-                                _sb_rest_post("students", token="", payload={"user_id": uid_new, "nome": aluno_nome.strip()}, service=True)
-                                st.success("Aluno criado com sucesso.")
-                            except Exception as e:
-                                st.error(f"Falha ao criar aluno: {e}")
-        else:
-            st.markdown("Entre com seu e-mail e senha.")
-            with st.form("form_login"):
-                email = st.text_input("E-mail")
-                password = st.text_input("Senha", type="password")
-                do = st.form_submit_button("Entrar")
-            if do:
-                try:
-                    auth = _sb_auth_login(email.strip(), password)
-                    token = auth.get("access_token")
-                    uid = auth.get("user", {}).get("id")
-                    role = _sb_get_role(uid, token) or "student"
-                    st.session_state["sb_token"] = token
-                    st.session_state["sb_refresh"] = auth.get("refresh_token")
-                    st.session_state["sb_uid"] = uid
-                    st.session_state["sb_email"] = email.strip()
-                    st.session_state["sb_role"] = role
-                    if role == "student":
-                        st.session_state["sb_student_nome"] = _sb_get_student_nome(uid, token)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Login falhou: {e}")
-
-# Define flags globais de permissão
-if st.session_state.get("sb_token") and st.session_state.get("sb_role"):
-    role = st.session_state.get("sb_role")
-    IS_STUDENT = (role == "student")
-    IS_TEACHER = (role == "teacher")
-    CURRENT_UID = st.session_state.get("sb_uid")
-    CURRENT_EMAIL = st.session_state.get("sb_email")
-    STUDENT_NOME = st.session_state.get("sb_student_nome")
-
-# Se Supabase estiver configurado, exija login (evita entrar como admin sem querer)
-if SUPABASE_URL and SUPABASE_ANON_KEY and not st.session_state.get("sb_token"):
-    st.sidebar.error("Faça login para acessar o app.")
-    st.stop()
+# Login opcional por senha (secrets / env). Se não definido, fica liberado.
+with st.sidebar.expander("Acesso (opcional)"):
+    senha_req = os.getenv("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", None) if hasattr(st, "secrets") else None
+    senha_in = st.text_input("Senha (se estiver configurada)", type="password")
+    if senha_req:
+        if senha_in != senha_req:
+            st.sidebar.warning("Senha necessária para usar o app.")
+    
 # Tema
 tema = st.sidebar.selectbox(
     "Tema do dashboard",
@@ -914,13 +767,16 @@ st.markdown(THEMES_CSS.get(tema, ""), unsafe_allow_html=True)
 modo_mobile = st.sidebar.toggle("Modo celular (layout compacto)", value=st.session_state.get("modo_mobile", False))
 st.session_state["modo_mobile"] = modo_mobile
 
-with st.sidebar.expander("Backup e exportacao"):
-    st.caption("Baixe um backup das bases (avaliacoes + treinos) ja com edicoes/exclusoes.")
-    try:
-        _bk = _make_backup_zip(avaliacao_db if "avaliacao_db" in locals() else pd.DataFrame(), _read_registro())
-        st.download_button("Baixar backup (ZIP)", data=_bk, file_name=BACKUP_ZIP_NAME, mime="application/zip")
-    except Exception as _e:
-        st.info("Backup ficara disponivel apos carregar os dados.")
+if IS_STUDENT:
+    st.sidebar.info('Modo aluno: backup completo é somente para professor.')
+else:
+    with st.sidebar.expander("Backup e exportacao"):
+        st.caption("Baixe um backup das bases (avaliacoes + treinos) ja com edicoes/exclusoes.")
+        try:
+            _bk = _make_backup_zip(avaliacao_db if "avaliacao_db" in locals() else pd.DataFrame(), _read_registro())
+            st.download_button("Baixar backup (ZIP)", data=_bk, file_name=BACKUP_ZIP_NAME, mime="application/zip")
+        except Exception as _e:
+            st.info("Backup ficara disponivel apos carregar os dados.")
 
 with st.sidebar.expander("Banco de dados (opcional)"):
     if _db_enabled():
@@ -929,11 +785,15 @@ with st.sidebar.expander("Banco de dados (opcional)"):
         st.warning("Sem banco configurado: usando arquivos CSV locais")
     st.caption("Se quiser usar Supabase/Neon/Postgres, configure DATABASE_URL em Settings > Secrets no Streamlit Cloud.")
 
-uploaded = st.sidebar.file_uploader(
-    "Envie o Excel (APP PERSONAL.xlsx)",
-    type=["xlsx"],
-    help="Se você não enviar, o app tenta carregar o arquivo padrão (APP PERSONAL.xlsx).",
-)
+if IS_STUDENT:
+    st.sidebar.info('Modo aluno: upload do Excel bloqueado (somente professor).')
+    xlsx_file = None
+else:
+    uploaded = st.sidebar.file_uploader(
+        "Envie o Excel (APP PERSONAL.xlsx)",
+        type=["xlsx"],
+        help="Se você não enviar, o app tenta carregar o arquivo padrão (APP PERSONAL.xlsx).",
+    )
 
 try:
     sheets = _load_workbook(uploaded.getvalue() if uploaded else None)
@@ -964,12 +824,7 @@ avaliacao_db = _to_date_col(avaliacao_db, "Data")
 
 nomes = sorted([x for x in avaliacao_db.get("Nome", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x.strip()])
 
-if IS_STUDENT and STUDENT_NOME:
-    # Aluno vê apenas os próprios dados
-    nomes_vis = [STUDENT_NOME] if STUDENT_NOME else (nomes if nomes else ["(sem nomes)"])
-    nome_sel = st.sidebar.selectbox("Nome", nomes_vis, disabled=True)
-else:
-    nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
+nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
 
 # Período rápido
 if avaliacao_db["Data"].notna().any():
@@ -1198,25 +1053,24 @@ with tab_av:
 
         b1, b2, b3 = st.columns([1, 1, 2])
         with b1:
-            if st.button("Excluir selecionadas", disabled=len(selected_ids) == 0):
-                st.session_state["confirm_delete"] = True
+            if IS_STUDENT:
+                st.info('Modo aluno: não é permitido excluir avaliações.')
+                st.session_state['confirm_delete'] = False
+            else:
+                if st.button('🗑️ Excluir selecionadas', disabled=(len(ids_sel) == 0)):
+                    st.session_state['confirm_delete'] = True
         with b2:
-            if st.button("Exportar base atual (Excel)"):
-                # exporta todas as avaliações do DB (não só filtradas)
-                db = avaliacao_db.copy()
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                    db.to_excel(writer, index=False, sheet_name="AVALIACAO_FISICA")
-                st.download_button(
-                    "Baixar Excel (base completa)",
-                    data=out.getvalue(),
-                    file_name="avaliacoes_atualizadas.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            if IS_STUDENT:
+                if st.button('⬇️ Baixar (Excel) - meus dados'):
+                    _download_excel(avaliacao_df, 'avaliacao_filtrada.xlsx')
+            else:
+                if st.button('⬇️ Baixar base (Excel)'):
+                    _download_excel(avaliacao_db, 'avaliacoes.xlsx')
         with b3:
+            st.write('')
             st.write("")
 
-        if st.session_state.get("confirm_delete"):
+        if (not IS_STUDENT) and st.session_state.get("confirm_delete"):
             st.warning(f"Confirmar exclusão de {len(selected_ids)} avaliação(ões)?")
             c1, c2 = st.columns(2)
             with c1:
@@ -1238,83 +1092,86 @@ with tab_av:
 
     # --------- Adicionar nova avaliação ---------
     with st.expander("Adicionar nova avaliação"):
-        base_cols = avaliacao_db.columns.tolist()
-
-        with st.form("form_nova_avaliacao", border=True):
-            c1, c2, c3 = st.columns([2, 1, 1])
-            with c1:
-                nome_novo = st.text_input("Nome", value=nome_sel if nome_sel != "(sem nomes)" else "")
-            with c2:
-                data_nova = st.date_input("Data", value=date.today())
-            with c3:
-                sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0)
-
-            # inputs principais
-            r1 = st.columns(4)
-            peso = r1[0].number_input("Peso (kg)", min_value=0.0, step=0.1, value=0.0)
-            altura = r1[1].number_input("Altura (m)", min_value=0.0, step=0.01, value=0.0)
-            idade = r1[2].number_input("Idade", min_value=0, step=1, value=0)
-            obs = r1[3].text_input("Observações", value="") if "Observacoes" in base_cols else ""
-
-            st.markdown("**Dobras cutâneas (mm)**")
-            d1 = st.columns(5)
-            d_pe = d1[0].number_input("D PE (peitoral)", min_value=0.0, step=0.1, value=0.0)
-            d_ab = d1[1].number_input("D AB (abdominal)", min_value=0.0, step=0.1, value=0.0)
-            d_cx = d1[2].number_input("D CX (coxa)", min_value=0.0, step=0.1, value=0.0)
-            d_si = d1[3].number_input("D SI (supra-ilíaca)", min_value=0.0, step=0.1, value=0.0)
-            d_tr = d1[4].number_input("D TR (tríceps)", min_value=0.0, step=0.1, value=0.0)
-
-            st.markdown("**Circunferências (cm)**")
-            ccs = st.columns(4)
-            cc = ccs[0].number_input("CC (cintura)", min_value=0.0, step=0.1, value=0.0)
-            cq = ccs[1].number_input("CQ (quadril)", min_value=0.0, step=0.1, value=0.0)
-            ca = ccs[2].number_input("CA (abdômen)", min_value=0.0, step=0.1, value=0.0)
-            # RCQ calculado, mas deixo visível
-            rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
-
-            submitted = st.form_submit_button("Salvar avaliação")
-
-        if submitted:
-            if not nome_novo.strip():
-                st.error("Preencha o Nome.")
-            elif sexo_val not in {"Homem", "Mulher"}:
-                st.error("Selecione o Sexo.")
-            else:
-                row = {c: None for c in base_cols}
-                row["Nome"] = nome_novo.strip()
-                row["Data"] = data_nova
-                row["Sexo"] = sexo_val
-
-                row["Peso"] = _to_float_or_none(peso, treat_zero_as_none=True)
-                row["Altura"] = _to_float_or_none(altura, treat_zero_as_none=True)
-                row["Idade"] = _to_float_or_none(idade, treat_zero_as_none=True)
-
-                row["D PE"] = _to_float_or_none(d_pe, treat_zero_as_none=True)
-                row["D AB"] = _to_float_or_none(d_ab, treat_zero_as_none=True)
-                row["D CX"] = _to_float_or_none(d_cx, treat_zero_as_none=True)
-                row["D SI"] = _to_float_or_none(d_si, treat_zero_as_none=True)
-                row["D TR"] = _to_float_or_none(d_tr, treat_zero_as_none=True)
-
-                row["CC"] = _to_float_or_none(cc, treat_zero_as_none=True)
-                row["CQ"] = _to_float_or_none(cq, treat_zero_as_none=True)
-                row["CA"] = _to_float_or_none(ca, treat_zero_as_none=True)
-
-                if "Observacoes" in base_cols:
-                    row["Observacoes"] = obs
-
-                row = _recompute_derived(row, base_cols)
-
-                # ID
-                row["ID"] = str(abs(hash(f"{row['Nome']}|{row['Data']}|{os.urandom(6).hex()}")))
-
-                db = avaliacao_db.copy()
-                db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-                db = _ensure_id(db)
-                _save_avaliacoes_db(db)
-
-                st.success("Avaliação salva.")
-                st.rerun()
-
+        if IS_STUDENT:
+            st.info('Modo aluno: apenas visualização (não é possível criar/editar avaliações).')
+        else:
+            base_cols = avaliacao_db.columns.tolist()
+            
+            with st.form("form_nova_avaliacao", border=True):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    nome_novo = st.text_input("Nome", value=nome_sel if nome_sel != "(sem nomes)" else "")
+                with c2:
+                    data_nova = st.date_input("Data", value=date.today())
+                with c3:
+                    sexo_val = st.selectbox("Sexo", ["", "Homem", "Mulher"], index=0)
+            
+                # inputs principais
+                r1 = st.columns(4)
+                peso = r1[0].number_input("Peso (kg)", min_value=0.0, step=0.1, value=0.0)
+                altura = r1[1].number_input("Altura (m)", min_value=0.0, step=0.01, value=0.0)
+                idade = r1[2].number_input("Idade", min_value=0, step=1, value=0)
+                obs = r1[3].text_input("Observações", value="") if "Observacoes" in base_cols else ""
+            
+                st.markdown("**Dobras cutâneas (mm)**")
+                d1 = st.columns(5)
+                d_pe = d1[0].number_input("D PE (peitoral)", min_value=0.0, step=0.1, value=0.0)
+                d_ab = d1[1].number_input("D AB (abdominal)", min_value=0.0, step=0.1, value=0.0)
+                d_cx = d1[2].number_input("D CX (coxa)", min_value=0.0, step=0.1, value=0.0)
+                d_si = d1[3].number_input("D SI (supra-ilíaca)", min_value=0.0, step=0.1, value=0.0)
+                d_tr = d1[4].number_input("D TR (tríceps)", min_value=0.0, step=0.1, value=0.0)
+            
+                st.markdown("**Circunferências (cm)**")
+                ccs = st.columns(4)
+                cc = ccs[0].number_input("CC (cintura)", min_value=0.0, step=0.1, value=0.0)
+                cq = ccs[1].number_input("CQ (quadril)", min_value=0.0, step=0.1, value=0.0)
+                ca = ccs[2].number_input("CA (abdômen)", min_value=0.0, step=0.1, value=0.0)
+                # RCQ calculado, mas deixo visível
+                rcq_manual = ccs[3].number_input("RCQ (auto)", min_value=0.0, step=0.0001, value=0.0, disabled=True)
+            
+                submitted = st.form_submit_button("Salvar avaliação")
+            
+            if submitted:
+                if not nome_novo.strip():
+                    st.error("Preencha o Nome.")
+                elif sexo_val not in {"Homem", "Mulher"}:
+                    st.error("Selecione o Sexo.")
+                else:
+                    row = {c: None for c in base_cols}
+                    row["Nome"] = nome_novo.strip()
+                    row["Data"] = data_nova
+                    row["Sexo"] = sexo_val
+            
+                    row["Peso"] = _to_float_or_none(peso, treat_zero_as_none=True)
+                    row["Altura"] = _to_float_or_none(altura, treat_zero_as_none=True)
+                    row["Idade"] = _to_float_or_none(idade, treat_zero_as_none=True)
+            
+                    row["D PE"] = _to_float_or_none(d_pe, treat_zero_as_none=True)
+                    row["D AB"] = _to_float_or_none(d_ab, treat_zero_as_none=True)
+                    row["D CX"] = _to_float_or_none(d_cx, treat_zero_as_none=True)
+                    row["D SI"] = _to_float_or_none(d_si, treat_zero_as_none=True)
+                    row["D TR"] = _to_float_or_none(d_tr, treat_zero_as_none=True)
+            
+                    row["CC"] = _to_float_or_none(cc, treat_zero_as_none=True)
+                    row["CQ"] = _to_float_or_none(cq, treat_zero_as_none=True)
+                    row["CA"] = _to_float_or_none(ca, treat_zero_as_none=True)
+            
+                    if "Observacoes" in base_cols:
+                        row["Observacoes"] = obs
+            
+                    row = _recompute_derived(row, base_cols)
+            
+                    # ID
+                    row["ID"] = str(abs(hash(f"{row['Nome']}|{row['Data']}|{os.urandom(6).hex()}")))
+            
+                    db = avaliacao_db.copy()
+                    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
+                    db = _ensure_id(db)
+                    _save_avaliacoes_db(db)
+            
+                    st.success("Avaliação salva.")
+                    st.rerun()
+            
     st.divider()
 
     # --------- Editar avaliação ---------
@@ -1535,6 +1392,8 @@ with tab_ficha:
 
             if st.button("Gerar ficha agora"):
                 st.session_state["ficha"] = []
+            if IS_STUDENT:
+                st.info('Modo aluno: não é permitido adicionar/editar treinos.')
                 for g in modelos[modelo][dia]:
                     exs_g = _get_exs_for_group(g)
                     for ex in exs_g[:n_ex_por_grupo]:
@@ -1617,7 +1476,7 @@ with tab_ficha:
 
             c1, c2, c3 = st.columns([1.2, 2, 1.2])
             with c1:
-                if st.button("Salvar no registro"):
+                if (not IS_STUDENT) and st.button("Salvar no registro"):
                     rows = df_ficha.to_dict(orient="records")
                     _append_registro(rows)
                     st.success("Treino salvo no registro.")
@@ -1714,7 +1573,7 @@ with tab_reg:
         column_config={
             "Selecionar": st.column_config.CheckboxColumn("Selecionar", help="Marque para editar/excluir"),
         },
-        disabled=[c for c in view.columns if c != "Selecionar"],
+        disabled=(True if IS_STUDENT else [c for c in view.columns if c != "Selecionar"]),
         key="reg_editor",
     )
 
@@ -1724,12 +1583,18 @@ with tab_reg:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Excluir selecionados", disabled=(len(selected_ids) == 0)):
-            st.session_state["confirm_del_treinos"] = True
+        if IS_STUDENT:
+            st.info('Modo aluno: não é permitido excluir/editar treinos.')
+        else:
+            if st.button("Excluir selecionados", disabled=(len(selected_ids) == 0)):
+                st.session_state["confirm_del_treinos"] = True
 
     with c2:
-        if st.button("Editar selecionado", disabled=(len(selected_ids) != 1)):
-            st.session_state["edit_treino_id"] = selected_ids[0]
+        if IS_STUDENT:
+            st.info('Modo aluno: não é permitido editar treinos.')
+        else:
+            if st.button("Editar selecionado", disabled=(len(selected_ids) != 1)):
+                st.session_state["edit_treino_id"] = selected_ids[0]
 
     with c3:
         # downloads filtrados
