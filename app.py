@@ -709,47 +709,169 @@ def _save_avaliacoes_db(df: pd.DataFrame):
 st.sidebar.title("App Personal")
 
 
-# Login e permissões (Aluno x Professor) - opcional via secrets/env
-# Secrets/env aceitos:
-# - TEACHER_PASSWORD (ou APP_PASSWORD como fallback)
-# - STUDENT_PASSWORD
-with st.sidebar.expander("Acesso (opcional)"):
-    teacher_pw = (os.getenv("TEACHER_PASSWORD")
-                  or (st.secrets.get("TEACHER_PASSWORD") if hasattr(st, "secrets") else None)
-                  or os.getenv("APP_PASSWORD")
-                  or (st.secrets.get("APP_PASSWORD") if hasattr(st, "secrets") else None))
-    student_pw = (os.getenv("STUDENT_PASSWORD")
-                  or (st.secrets.get("STUDENT_PASSWORD") if hasattr(st, "secrets") else None))
+# -------------------------------------------------
+# Acesso (Supabase Auth) - recomendado
+# - Professor: pode editar/inserir
+# - Aluno: somente visualização e exportação
+# Requer secrets:
+#   SUPABASE_URL, SUPABASE_ANON_KEY
+# Opcional (para professor criar alunos pelo app):
+#   SUPABASE_SERVICE_ROLE_KEY
+# -------------------------------------------------
+import httpx
 
-    # Persistir escolha no session_state
-    default_role = st.session_state.get("role", "Professor" if (teacher_pw is None and student_pw is None) else "Visitante")
-    role = st.selectbox("Perfil", ["Visitante", "Aluno", "Professor"], index=["Visitante","Aluno","Professor"].index(default_role))
-    pw_in = st.text_input("Senha (se estiver configurada)", type="password")
+def _sb_get(name: str, default=None):
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return st.secrets.get(name)
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
-    auth_ok = True
-    if role == "Aluno":
-        if student_pw:
-            auth_ok = (pw_in == student_pw)
+SUPABASE_URL = _sb_get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = _sb_get("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = _sb_get("SUPABASE_SERVICE_ROLE_KEY", "")
+PROFESSOR_SIGNUP_CODE = _sb_get("PROFESSOR_SIGNUP_CODE", "")
+
+def _sb_headers(token: str | None = None, service: bool = False):
+    key = SUPABASE_SERVICE_ROLE_KEY if service else SUPABASE_ANON_KEY
+    h = {"apikey": key}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+def _sb_auth_login(email: str, password: str):
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+    r = httpx.post(url, headers=_sb_headers(), json={"email": email, "password": password}, timeout=20.0)
+    r.raise_for_status()
+    return r.json()
+
+def _sb_rest_get(path: str, token: str, params: dict | None = None):
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    r = httpx.get(url, headers=_sb_headers(token=token), params=params or {}, timeout=20.0)
+    r.raise_for_status()
+    return r.json()
+
+def _sb_rest_post(path: str, token: str, payload: list[dict] | dict, service: bool = False):
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = _sb_headers(token=token if not service else None, service=service)
+    headers["Content-Type"] = "application/json"
+    headers["Prefer"] = "return=representation"
+    r = httpx.post(url, headers=headers, json=payload, timeout=20.0)
+    r.raise_for_status()
+    return r.json()
+
+def _sb_admin_create_user(email: str, password: str):
+    url = f"{SUPABASE_URL}/auth/v1/admin/users"
+    headers = _sb_headers(service=True)
+    headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
+    headers["Content-Type"] = "application/json"
+    r = httpx.post(url, headers=headers, json={"email": email, "password": password, "email_confirm": True}, timeout=20.0)
+    r.raise_for_status()
+    return r.json()
+
+def _sb_get_role(uid: str, token: str) -> str | None:
+    try:
+        rows = _sb_rest_get("profiles", token, params={"select":"role", "user_id": f"eq.{uid}"})
+        if rows:
+            return rows[0].get("role")
+    except Exception:
+        return None
+    return None
+
+def _sb_get_student_nome(uid: str, token: str) -> str | None:
+    try:
+        rows = _sb_rest_get("students", token, params={"select":"nome", "user_id": f"eq.{uid}"})
+        if rows:
+            return (rows[0].get("nome") or "").strip() or None
+    except Exception:
+        return None
+    return None
+
+# Estado padrão (para não quebrar o app)
+IS_STUDENT = False
+IS_TEACHER = True
+CURRENT_UID = None
+CURRENT_EMAIL = None
+STUDENT_NOME = None
+
+with st.sidebar.expander("Acesso (login por e-mail)"):
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        st.warning("Supabase não configurado (SUPABASE_URL / SUPABASE_ANON_KEY). O app fica sem login por e-mail.")
+    else:
+        if st.session_state.get("sb_token"):
+            token = st.session_state.get("sb_token")
+            CURRENT_UID = st.session_state.get("sb_uid")
+            CURRENT_EMAIL = st.session_state.get("sb_email")
+            role = st.session_state.get("sb_role", None)
+
+            st.success(f"Logado: {CURRENT_EMAIL} ({role or 'sem perfil'})")
+            if st.button("Sair"):
+                for k in ["sb_token","sb_refresh","sb_uid","sb_email","sb_role","sb_student_nome"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+            # Criar aluno (somente professor)
+            if role == "teacher":
+                st.markdown("**Criar aluno (somente professor)**")
+                if not SUPABASE_SERVICE_ROLE_KEY:
+                    st.info("Defina SUPABASE_SERVICE_ROLE_KEY nos Secrets para habilitar criação de alunos.")
+                else:
+                    with st.form("form_create_student"):
+                        aluno_email = st.text_input("E-mail do aluno")
+                        aluno_senha = st.text_input("Senha inicial", type="password")
+                        aluno_nome = st.text_input("Nome do aluno (como no Excel)")
+                        codigo = st.text_input("Código do professor", type="password")
+                        ok = st.form_submit_button("Criar aluno")
+                    if ok:
+                        if PROFESSOR_SIGNUP_CODE and codigo != PROFESSOR_SIGNUP_CODE:
+                            st.error("Código do professor inválido.")
+                        else:
+                            try:
+                                u = _sb_admin_create_user(aluno_email.strip(), aluno_senha)
+                                uid_new = u.get("id")
+                                # cria profile + student
+                                _sb_rest_post("profiles", token="", payload={"user_id": uid_new, "role": "student"}, service=True)
+                                _sb_rest_post("students", token="", payload={"user_id": uid_new, "nome": aluno_nome.strip()}, service=True)
+                                st.success("Aluno criado com sucesso.")
+                            except Exception as e:
+                                st.error(f"Falha ao criar aluno: {e}")
         else:
-            # Sem senha configurada: continua somente visualização
-            auth_ok = True
-    elif role == "Professor":
-        if teacher_pw:
-            auth_ok = (pw_in == teacher_pw)
-        else:
-            # Sem senha configurada: libera como professor
-            auth_ok = True
+            st.markdown("Entre com seu e-mail e senha.")
+            with st.form("form_login"):
+                email = st.text_input("E-mail")
+                password = st.text_input("Senha", type="password")
+                do = st.form_submit_button("Entrar")
+            if do:
+                try:
+                    auth = _sb_auth_login(email.strip(), password)
+                    token = auth.get("access_token")
+                    uid = auth.get("user", {}).get("id")
+                    role = _sb_get_role(uid, token) or "student"
+                    st.session_state["sb_token"] = token
+                    st.session_state["sb_refresh"] = auth.get("refresh_token")
+                    st.session_state["sb_uid"] = uid
+                    st.session_state["sb_email"] = email.strip()
+                    st.session_state["sb_role"] = role
+                    if role == "student":
+                        st.session_state["sb_student_nome"] = _sb_get_student_nome(uid, token)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login falhou: {e}")
 
-    if not auth_ok:
-        st.warning("Senha incorreta para este perfil.")
-        role = "Visitante"
+# Define flags globais de permissão
+if st.session_state.get("sb_token") and st.session_state.get("sb_role"):
+    role = st.session_state.get("sb_role")
+    IS_STUDENT = (role == "student")
+    IS_TEACHER = (role == "teacher")
+    CURRENT_UID = st.session_state.get("sb_uid")
+    CURRENT_EMAIL = st.session_state.get("sb_email")
+    STUDENT_NOME = st.session_state.get("sb_student_nome")
 
-    st.session_state["role"] = role
-
-# Flags globais de permissão
-ROLE = st.session_state.get("role", "Visitante")
-IS_STUDENT = ROLE in ("Visitante", "Aluno")
-IS_TEACHER = ROLE == "Professor"
+# Se Supabase estiver configurado, exija login (evita entrar como admin sem querer)
+if SUPABASE_URL and SUPABASE_ANON_KEY and not st.session_state.get("sb_token"):
+    st.sidebar.error("Faça login para acessar o app.")
+    st.stop()
 # Tema
 tema = st.sidebar.selectbox(
     "Tema do dashboard",
@@ -842,7 +964,12 @@ avaliacao_db = _to_date_col(avaliacao_db, "Data")
 
 nomes = sorted([x for x in avaliacao_db.get("Nome", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x.strip()])
 
-nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
+if IS_STUDENT and STUDENT_NOME:
+    # Aluno vê apenas os próprios dados
+    nomes_vis = [STUDENT_NOME] if STUDENT_NOME else (nomes if nomes else ["(sem nomes)"])
+    nome_sel = st.sidebar.selectbox("Nome", nomes_vis, disabled=True)
+else:
+    nome_sel = st.sidebar.selectbox("Nome", nomes if nomes else ["(sem nomes)"])
 
 # Período rápido
 if avaliacao_db["Data"].notna().any():
